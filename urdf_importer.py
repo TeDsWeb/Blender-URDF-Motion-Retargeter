@@ -341,7 +341,10 @@ def avg_pos(arm, names):
     return sum(pts, mathutils.Vector((0,0,0))) / len(pts)
 
 def create_humanoid_meta_rig(robot, urdf_arm_obj):
-
+    """
+    Erzeugt die humanoide Meta-Rig Armature basierend auf den URDF-Bones
+    und verbindet die URDF-Bones über CHILD_OF Constraints.
+    """
     urdf_to_generic = {j.name: j.generic_name for j in robot.joints.values()}
 
     humanoid_map = {}
@@ -349,41 +352,33 @@ def create_humanoid_meta_rig(robot, urdf_arm_obj):
         if urdf_name in urdf_to_generic:
             humanoid_map.setdefault(humanoid_bone, []).append(urdf_to_generic[urdf_name])
 
-    # ------------------------------------------------------------
-    # URDF-Positionen auslesen
-    # ------------------------------------------------------------
-    left_shoulder  = avg_pos(urdf_arm_obj, humanoid_map.get("LeftArm", []))
-    right_shoulder = avg_pos(urdf_arm_obj, humanoid_map.get("RightArm", []))
-    left_elbow     = avg_pos(urdf_arm_obj, humanoid_map.get("LeftForeArm", []))
-    right_elbow    = avg_pos(urdf_arm_obj, humanoid_map.get("RightForeArm", []))
+    # Durchschnittspositionen der URDF-Bones auslesen
+    def avg_pos(names):
+        pts = []
+        for n in names:
+            pb = urdf_arm_obj.pose.bones.get(n)
+            if pb:
+                pts.append(pb.head)
+        if pts:
+            return sum(pts, mathutils.Vector((0,0,0))) / len(pts)
+        else:
+            return mathutils.Vector((0,0,0))
 
-    left_hip   = avg_pos(urdf_arm_obj, humanoid_map.get("LeftUpLeg", []))
-    right_hip  = avg_pos(urdf_arm_obj, humanoid_map.get("RightUpLeg", []))
-    left_knee  = avg_pos(urdf_arm_obj, humanoid_map.get("LeftLeg", []))
-    right_knee = avg_pos(urdf_arm_obj, humanoid_map.get("RightLeg", []))
-    left_foot  = avg_pos(urdf_arm_obj, humanoid_map.get("LeftFoot", []))
-    right_foot = avg_pos(urdf_arm_obj, humanoid_map.get("RightFoot", []))
+    # Schulter / Ellbogen / Hüfte / Knie / Fuß Positionen
+    left_shoulder  = avg_pos(humanoid_map.get("LeftArm", []))
+    right_shoulder = avg_pos(humanoid_map.get("RightArm", []))
+    left_elbow     = avg_pos(humanoid_map.get("LeftForeArm", []))
+    right_elbow    = avg_pos(humanoid_map.get("RightForeArm", []))
+    left_hip       = avg_pos(humanoid_map.get("LeftUpLeg", []))
+    right_hip      = avg_pos(humanoid_map.get("RightUpLeg", []))
+    left_knee      = avg_pos(humanoid_map.get("LeftLeg", []))
+    right_knee     = avg_pos(humanoid_map.get("RightLeg", []))
+    left_foot      = avg_pos(humanoid_map.get("LeftFoot", []))
+    right_foot     = avg_pos(humanoid_map.get("RightFoot", []))
 
-    # ------------------------------------------------------------
-    # Schulterebene humanoid standardisieren (Z = URDF, X/Y fix)
-    # ------------------------------------------------------------
-    shoulder_height = (left_shoulder.z + right_shoulder.z) * 0.5
-    shoulder_depth = 0.0
-    half_width = 0.12
-
-    left_shoulder_pos  = mathutils.Vector((-half_width, shoulder_depth, shoulder_height))
-    right_shoulder_pos = mathutils.Vector((+half_width, shoulder_depth, shoulder_height))
-    shoulder_center    = mathutils.Vector((0.0, shoulder_depth, shoulder_height))
-
-    # Hüftmitte
-    hip_center = (left_hip + right_hip) * 0.5
-
-    # ------------------------------------------------------------
-    # Meta-Armature erzeugen
-    # ------------------------------------------------------------
+    # Erstellen der Meta-Rig Armature
     meta_arm = bpy.data.armatures.new(f"{robot.name}_Humanoid_Armature")
     meta_obj = bpy.data.objects.new(f"{robot.name}_Humanoid_Meta_Rig", meta_arm)
-
     if urdf_arm_obj.users_collection:
         urdf_arm_obj.users_collection[0].objects.link(meta_obj)
     else:
@@ -393,113 +388,86 @@ def create_humanoid_meta_rig(robot, urdf_arm_obj):
     bpy.ops.object.mode_set(mode='EDIT')
     mb = meta_arm.edit_bones
 
-    # ------------------------------------------------------------
-    # Wirbelsäule humanoid
-    # ------------------------------------------------------------
+    # Wirbelsäule
     hips = mb.new("Hips")
-    hips.head = hip_center
-    hips.tail = hip_center + mathutils.Vector((0, 0, 0.15))
+    hips.head = (left_hip + right_hip)/2
+    hips.tail = hips.head + mathutils.Vector((0,0,0.15))
 
     spine = mb.new("Spine")
     spine.head = hips.tail
-    spine.tail = spine.head + mathutils.Vector((0, 0, 0.15))
+    spine.tail = spine.head + mathutils.Vector((0,0,0.15))
     spine.parent = hips
 
-    spine1 = mb.new("Spine1")
-    spine1.head = spine.tail
-    spine1.tail = shoulder_center
-    spine1.parent = spine
-
-    # ------------------------------------------------------------
-    # Hals & Kopf humanoid
-    # ------------------------------------------------------------
+    # Kopf
     neck = mb.new("Neck")
-    neck.head = shoulder_center
-    neck.tail = shoulder_center + mathutils.Vector((0, 0, 0.12))
-    neck.parent = spine1
+    neck.head = spine.tail
+    neck.tail = neck.head + mathutils.Vector((0,0,0.12))
+    neck.parent = spine
 
     head = mb.new("Head")
     head.head = neck.tail
-    head.tail = neck.tail + mathutils.Vector((0, 0, 0.18))
+    head.tail = head.head + mathutils.Vector((0,0,0.18))
     head.parent = neck
 
-    # ------------------------------------------------------------
-    # Beine (URDF-realistisch)
-    # ------------------------------------------------------------
-    def make_leg(side, hip_pos, knee_pos, foot_pos):
-        if knee_pos.length == 0 or foot_pos.length == 0:
+    # Arme
+    def make_arm(side, shoulder, elbow):
+        if shoulder.length == 0 or elbow.length == 0:
             return
+        sgn = 1 if side == "Right" else -1
+        arm = mb.new(f"{side}Arm")
+        arm.head = shoulder
+        arm.tail = elbow
+        arm.parent = spine
+        fore = mb.new(f"{side}ForeArm")
+        fore.head = elbow
+        fore.tail = elbow + mathutils.Vector((sgn*0.2,0,0))
+        fore.parent = arm
 
+    make_arm("Left", left_shoulder, left_elbow)
+    make_arm("Right", right_shoulder, right_elbow)
+
+    # Beine
+    def make_leg(side, hip, knee, foot):
+        if hip.length == 0 or knee.length == 0 or foot.length == 0:
+            return
         up = mb.new(f"{side}UpLeg")
-        up.head = hip_pos
-        up.tail = knee_pos
+        up.head = hip
+        up.tail = knee
         up.parent = hips
-
-        leg = mb.new(f"{side}Leg")
-        leg.head = knee_pos
-        leg.tail = foot_pos
-        leg.parent = up
-
+        lo = mb.new(f"{side}Leg")
+        lo.head = knee
+        lo.tail = foot
+        lo.parent = up
         foot_b = mb.new(f"{side}Foot")
-        foot_b.head = foot_pos
-        foot_b.tail = foot_pos + mathutils.Vector((0.12, 0, 0))
-        foot_b.parent = leg
+        foot_b.head = foot
+        foot_b.tail = foot + mathutils.Vector((0.12, 0, 0))
+        foot_b.parent = lo
 
-    make_leg("Left",  left_hip,  left_knee,  left_foot)
+    make_leg("Left", left_hip, left_knee, left_foot)
     make_leg("Right", right_hip, right_knee, right_foot)
 
-    # ------------------------------------------------------------
-    # Arme humanoid horizontal
-    # ------------------------------------------------------------
-    def make_arm(side, shoulder_pos, elbow_pos):
-        side_sign = 1 if side == "Right" else -1
-        arm_len = 0.25
-
-        arm = mb.new(f"{side}Arm")
-        arm.head = shoulder_pos
-        arm.tail = shoulder_pos + mathutils.Vector((side_sign * arm_len, 0, 0))
-        arm.parent = spine1
-        arm.roll = 0
-        arm.align_roll(mathutils.Vector((0, 0, 1)))
-
-        fore = mb.new(f"{side}ForeArm")
-        fore.head = arm.tail
-        fore.tail = arm.tail + mathutils.Vector((side_sign * arm_len * 0.8, 0, 0))
-        fore.parent = arm
-        fore.roll = 0
-        fore.align_roll(mathutils.Vector((0, 0, 1)))
-
-        hand = mb.new(f"{side}Hand")
-        hand.head = fore.tail
-        hand.tail = fore.tail + mathutils.Vector((side_sign * arm_len * 0.4, 0, 0))
-        hand.parent = fore
-        hand.roll = 0
-        hand.align_roll(mathutils.Vector((0, 0, 1)))
-
-    make_arm("Left",  left_shoulder_pos,  left_elbow)
-    make_arm("Right", right_shoulder_pos, right_elbow)
+    # Ensure the right foot is correctly connected to the spine
+    right_foot_bone = mb.new("RightFoot")
+    right_foot_bone.head = right_foot
+    right_foot_bone.tail = right_foot + mathutils.Vector((0.12, 0, 0))
+    right_foot_bone.parent = spine
 
     bpy.ops.object.mode_set(mode='POSE')
 
-    # ------------------------------------------------------------
-    # KORRIGIERTE CONSTRAINTS (keine Z-Verdrehung mehr)
-    # ------------------------------------------------------------
-    for humanoid_bone, urdf_bones in humanoid_map.items():
-        hp = meta_obj.pose.bones.get(humanoid_bone)
-        if not hp:
+    # Constraints: URDF -> Meta-Rig
+    for meta_name, urdf_bones in humanoid_map.items():
+        mbone = meta_obj.pose.bones.get(meta_name)
+        if not mbone:
             continue
-        for urdf_bone in urdf_bones:
-            up = urdf_arm_obj.pose.bones.get(urdf_bone)
-            if not up:
+        for urdf_b in urdf_bones:
+            upb = urdf_arm_obj.pose.bones.get(urdf_b)
+            if not upb:
                 continue
-
-            child = up.constraints.new("CHILD_OF")
-            child.target = meta_obj
-            child.subtarget = humanoid_bone
-
-            # WICHTIG: Offset korrekt setzen
+            c = upb.constraints.new("CHILD_OF")
+            c.target = meta_obj
+            c.subtarget = meta_name
             bpy.context.view_layer.update()
-            child.inverse_matrix = up.matrix.inverted()
+            c.inverse_matrix = upb.matrix.inverted()
 
     bpy.ops.object.mode_set(mode='OBJECT')
     return meta_obj
