@@ -1,10 +1,10 @@
 bl_info = {
     "name": "URDF Humanoid BVH Retarget",
     "author": "Dominik Brämer",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > URDF Humanoid",
-    "description": "URDF Import + BVH mapping with interactive N-Panel (BVH → URDF)",
+    "description": "URDF Import + BVH mapping with interactive N-Panel (BVH → URDF) using UILists",
     "category": "Import-Export",
 }
 
@@ -13,8 +13,8 @@ import os
 import mathutils
 from bpy_extras.io_utils import ImportHelper
 import xml.etree.ElementTree as ET
-from bpy.props import StringProperty, PointerProperty, CollectionProperty
-from bpy.types import PropertyGroup, Operator, Panel
+from bpy.props import StringProperty, PointerProperty, CollectionProperty, IntProperty
+from bpy.types import PropertyGroup, Operator, Panel, UIList
 
 # ============================================================
 # URDF DATA STRUCTURES
@@ -196,10 +196,10 @@ def bind_meshes(robot, arm_obj, link_mats, base_path):
             obj.parent_type = 'OBJECT'
 
 # ============================================================
-# Multi-BVH Mapping
+# Multi-BVH Mapping (mit UILists)
 # ============================================================
 class BVHMappingBone(PropertyGroup):
-    bvh_bone_name: StringProperty(name="BVH Bone")
+    bvh_bone_name: StringProperty(name="URDF Bone")
 
 class BVHMappingItem(PropertyGroup):
     urdf_bones: CollectionProperty(type=BVHMappingBone)
@@ -207,9 +207,31 @@ class BVHMappingItem(PropertyGroup):
 
 class BVHMappingSettings(PropertyGroup):
     mappings: CollectionProperty(type=BVHMappingItem)
+    active_mapping_index: IntProperty(default=0)
+    active_urdf_index: IntProperty(default=0)
 
-# OT_GenerateMappingList Operator
-class OT_GenerateMappingList(bpy.types.Operator):
+# UILists
+class UL_BVHMappingList(UIList):
+    bl_idname = "UL_BVHMappingList"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row()
+        row.label(text=item.bvh_bone_name)
+        row.label(text=f"{len(item.urdf_bones)} URDF")
+
+class UL_URDFBoneList(UIList):
+    bl_idname = "UL_URDFBoneList"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        scene = context.scene
+        row = layout.row()
+        if scene.urdf_rig_object:
+            row.prop_search(item, "bvh_bone_name", scene.urdf_rig_object.pose, "bones", text="")
+        else:
+            row.label(text=item.bvh_bone_name or "<URDF Bone>")
+
+# Operators
+class OT_GenerateMappingList(Operator):
     bl_idname = "object.generate_mapping_list"
     bl_label = "Generate Mapping List"
     
@@ -224,9 +246,11 @@ class OT_GenerateMappingList(bpy.types.Operator):
         for ub in [pb.name for pb in bvh_rig.pose.bones]:
             item = settings.mappings.add()
             item.bvh_bone_name = ub
+
+        settings.active_mapping_index = 0
+        settings.active_urdf_index = 0
         return {'FINISHED'}
 
-# OT_ApplyBVHMapping Operator
 class OT_ApplyBVHMapping(bpy.types.Operator):
     bl_idname = "object.apply_bvh_mapping"
     bl_label = "Apply Mapping"
@@ -239,22 +263,41 @@ class OT_ApplyBVHMapping(bpy.types.Operator):
         if not urdf_rig or not bvh_rig:
             return {'CANCELLED'}
         
-        for item in settings.mappings:
-            for b in item.urdf_bones:
-                urdf_b = urdf_rig.pose.bones.get(b.name)
-                bvh_b = bvh_rig.pose.bones.get(item.bvh_bone_name)
-                if urdf_b and bvh_b:
-                    # Apply Child-of constraint for URDF-Bone → BVH-Bone
-                    c = urdf_b.constraints.new("CHILD_OF")
-                    c.target = bvh_rig
-                    c.subtarget = item.bvh_bone_name
-                    c.inverse_matrix = urdf_b.matrix.inverted()
+        # 1) Alle alten Constraints auf dem URDF-Rig entfernen
+        for pb in urdf_rig.pose.bones:
+            for c in list(pb.constraints):
+                pb.constraints.remove(c)
+
         
+        # 2) Für jedes Mapping nur COPY_ROTATION im lokalen Raum setzen
+        for item in settings.mappings:
+            bvh_b = bvh_rig.pose.bones.get(item.bvh_bone_name)
+            if not bvh_b:
+                continue
+
+            for b in item.urdf_bones:
+                urdf_b = urdf_rig.pose.bones.get(b.bvh_bone_name)
+                if not urdf_b:
+                    continue
+
+                c = urdf_b.constraints.new("COPY_ROTATION")
+                c.target = bvh_rig
+                c.subtarget = item.bvh_bone_name
+
+                # Nur Rotation, kein Versetzen
+                c.target_space = 'LOCAL'
+                c.owner_space = 'LOCAL'
+
+                # Erstmal alle Achsen aktiv lassen – später können wir pro URDF-Joint filtern
+                c.use_x = True
+                c.use_y = True
+                c.use_z = True
+                c.mix_mode = 'ADD'
+
         bpy.context.view_layer.update()
         return {'FINISHED'}
 
-# OT_AddBVHBone Operator
-class OT_AddBVHBone(bpy.types.Operator):
+class OT_AddBVHBone(Operator):
     bl_idname = "object.add_urdf_bone"
     bl_label = "Add URDF Bone"
     
@@ -263,43 +306,46 @@ class OT_AddBVHBone(bpy.types.Operator):
     def execute(self, context):
         scene = context.scene
         settings = scene.bvh_mapping_settings
+
         for item in settings.mappings:
             if item.bvh_bone_name == self.bvh_bone_name:
                 new_bone = item.urdf_bones.add()
-                new_bone.bvh_bone_name = self.bvh_bone_name  # Link URDF bone to the selected BVH bone
+                new_bone.bvh_bone_name = ""
+
         return {'FINISHED'}
 
-# Operator für das Entfernen von BVH-Bones
-class OT_RemoveBVHBone(bpy.types.Operator):
+class OT_RemoveBVHBone(Operator):
     bl_idname = "object.remove_urdf_bone"
     bl_label = "Remove URDF Bone"
     
     bvh_bone_name: StringProperty()
-    index: bpy.props.IntProperty()
+    index: IntProperty()
     
     def execute(self, context):
         scene = context.scene
         settings = scene.bvh_mapping_settings
+
         for item in settings.mappings:
             if item.bvh_bone_name == self.bvh_bone_name:
-                item.urdf_bones.remove(self.index)
+                if 0 <= self.index < len(item.urdf_bones):
+                    item.urdf_bones.remove(self.index)
+
         return {'FINISHED'}
-    
-# Operator für das Zurücksetzen der Mapping-Liste
-class OT_ResetBVHMapping(bpy.types.Operator):
+
+class OT_ResetBVHMapping(Operator):
     bl_idname = "object.reset_bvh_mapping"
     bl_label = "Reset Mapping List"
     
     def execute(self, context):
-        scene = context.scene
-        settings = scene.bvh_mapping_settings
-        settings.mappings.clear()  # Alle Mappings zurücksetzen
+        context.scene.bvh_mapping_settings.mappings.clear()
+        context.scene.bvh_mapping_settings.active_mapping_index = 0
+        context.scene.bvh_mapping_settings.active_urdf_index = 0
         return {'FINISHED'}
 
 # ============================================================
 # N-Panel UI
 # ============================================================
-class PANEL_BVHMapping(bpy.types.Panel):
+class PANEL_BVHMapping(Panel):
     bl_label = "BVH -> URDF Mapping"
     bl_idname = "VIEW3D_PT_bvh_mapping"
     bl_space_type = 'VIEW_3D'
@@ -313,33 +359,56 @@ class PANEL_BVHMapping(bpy.types.Panel):
 
         layout.prop(scene, "urdf_rig_object")
         layout.prop(scene, "bvh_rig_object")
-        layout.operator("object.generate_mapping_list", text="Generate Mapping List")
+
+        row = layout.row()
+        row.operator("object.generate_mapping_list", text="Generate Mapping List")
+        row.operator("object.reset_bvh_mapping", text="Reset")
+
         layout.operator("object.apply_bvh_mapping", text="Apply Mapping")
-        layout.operator("object.reset_bvh_mapping", text="Reset Mapping List")
 
         if not settings.mappings:
             layout.label(text="Click 'Generate Mapping List' to show bones.")
             return
 
-        for item in settings.mappings:
-            box = layout.box()
-            box.label(text=f"BVH Bone: {item.bvh_bone_name}")
+        box = layout.box()
+        box.label(text="BVH Bones")
+        box.template_list(
+            "UL_BVHMappingList",
+            "",
+            settings,
+            "mappings",
+            settings,
+            "active_mapping_index",
+        )
 
-            for idx, b in enumerate(item.urdf_bones):
-                row = box.row()
-                if scene.urdf_rig_object:  # Use URDF bones for selection
-                    row.prop_search(b, "bvh_bone_name", scene.urdf_rig_object.pose, "bones", text="")
-                op = row.operator("object.remove_urdf_bone", text="-")
-                op.bvh_bone_name = item.bvh_bone_name
-                op.index = idx
+        if 0 <= settings.active_mapping_index < len(settings.mappings):
+            active_item = settings.mappings[settings.active_mapping_index]
 
-            add_op = box.operator("object.add_urdf_bone", text="+ Add URDF Bone")
-            add_op.bvh_bone_name = item.bvh_bone_name
+            box2 = layout.box()
+            box2.label(text=f"URDF Bones for: {active_item.bvh_bone_name}")
+
+            row = box2.row()
+            row.template_list(
+                "UL_URDFBoneList",
+                "",
+                active_item,
+                "urdf_bones",
+                settings,
+                "active_urdf_index",
+            )
+
+            col = row.column(align=True)
+            add = col.operator("object.add_urdf_bone", text="", icon="ADD")
+            add.bvh_bone_name = active_item.bvh_bone_name
+
+            rem = col.operator("object.remove_urdf_bone", text="", icon="REMOVE")
+            rem.bvh_bone_name = active_item.bvh_bone_name
+            rem.index = settings.active_urdf_index
 
 # ============================================================
 # Import URDF Operator
 # ============================================================
-class IMPORT_OT_urdf_humanoid(bpy.types.Operator, ImportHelper):
+class IMPORT_OT_urdf_humanoid(Operator, ImportHelper):
     bl_idname = "import_scene.urdf_humanoid"
     bl_label = "Import URDF Humanoid"
     filename_ext = ".urdf"
@@ -357,16 +426,22 @@ class IMPORT_OT_urdf_humanoid(bpy.types.Operator, ImportHelper):
 # REGISTER
 # ============================================================
 classes = [
+    URDFVisual,
+    URDFLink,
+    URDFJoint,
+    URDFRobot,
     BVHMappingBone,
     BVHMappingItem,
     BVHMappingSettings,
+    UL_BVHMappingList,
+    UL_URDFBoneList,
     OT_GenerateMappingList,
     OT_AddBVHBone,
     OT_RemoveBVHBone,
     OT_ApplyBVHMapping,
     OT_ResetBVHMapping,
     PANEL_BVHMapping,
-    IMPORT_OT_urdf_humanoid
+    IMPORT_OT_urdf_humanoid,
 ]
 
 def menu_func_import(self, context):
@@ -374,19 +449,25 @@ def menu_func_import(self, context):
 
 def register():
     for cls in classes:
-        bpy.utils.register_class(cls)
+        try:
+            bpy.utils.register_class(cls)
+        except RuntimeError:
+            pass
     bpy.types.Scene.bvh_mapping_settings = PointerProperty(type=BVHMappingSettings)
     bpy.types.Scene.urdf_rig_object = PointerProperty(name="URDF Rig", type=bpy.types.Object)
     bpy.types.Scene.bvh_rig_object = PointerProperty(name="BVH Rig", type=bpy.types.Object)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
 
 def unregister():
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     del bpy.types.Scene.bvh_mapping_settings
     del bpy.types.Scene.urdf_rig_object
     del bpy.types.Scene.bvh_rig_object
-    bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+    for cls in reversed(classes):
+        try:
+            bpy.utils.unregister_class(cls)
+        except RuntimeError:
+            pass
 
 if __name__ == "__main__":
     register()
