@@ -266,7 +266,7 @@ class OT_AddBVHBone(bpy.types.Operator):
         for item in settings.mappings:
             if item.bvh_bone_name == self.bvh_bone_name:
                 new_bone = item.urdf_bones.add()
-                new_bone.bvh_bone_name = self.bvh_bone_name
+                new_bone.bvh_bone_name = self.bvh_bone_name  # Link URDF bone to the selected BVH bone
         return {'FINISHED'}
 
 # Operator für das Entfernen von BVH-Bones
@@ -327,8 +327,8 @@ class PANEL_BVHMapping(bpy.types.Panel):
 
             for idx, b in enumerate(item.urdf_bones):
                 row = box.row()
-                if scene.bvh_rig_object:
-                    row.prop_search(b, "bvh_bone_name", scene.bvh_rig_object.pose, "bones", text="")
+                if scene.urdf_rig_object:  # Use URDF bones for selection
+                    row.prop_search(b, "bvh_bone_name", scene.urdf_rig_object.pose, "bones", text="")
                 op = row.operator("object.remove_urdf_bone", text="-")
                 op.bvh_bone_name = item.bvh_bone_name
                 op.index = idx
