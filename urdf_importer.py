@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "URDF Humanoid Multi-BVH Retarget",
-    "author": "Dominik + ChatGPT",
-    "version": (1, 0, 2),
+    "name": "URDF Humanoid BVH Retarget",
+    "author": "Dominik Brämer",
+    "version": (1, 0, 0),
     "blender": (3, 0, 0),
     "location": "File > Import > URDF Humanoid",
-    "description": "URDF Import + Multi-BVH mapping with interactive N-Panel (BVH → URDF)",
+    "description": "URDF Import + BVH mapping with interactive N-Panel (BVH → URDF)",
     "category": "Import-Export",
 }
 
