@@ -208,6 +208,7 @@ class BVHMappingItem(PropertyGroup):
 class BVHMappingSettings(PropertyGroup):
     mappings: CollectionProperty(type=BVHMappingItem)
 
+# OT_GenerateMappingList Operator
 class OT_GenerateMappingList(bpy.types.Operator):
     bl_idname = "object.generate_mapping_list"
     bl_label = "Generate Mapping List"
@@ -215,26 +216,17 @@ class OT_GenerateMappingList(bpy.types.Operator):
     def execute(self, context):
         scene = context.scene
         settings = scene.bvh_mapping_settings
-        urdf_rig = scene.urdf_rig_object
-        if not urdf_rig:
+        bvh_rig = scene.bvh_rig_object
+        if not bvh_rig:
             return {'CANCELLED'}
         
         settings.mappings.clear()
-        for ub in [pb.name for pb in urdf_rig.pose.bones]:
+        for ub in [pb.name for pb in bvh_rig.pose.bones]:
             item = settings.mappings.add()
             item.bvh_bone_name = ub
         return {'FINISHED'}
 
-class OT_ResetBVHMapping(bpy.types.Operator):
-    bl_idname = "object.reset_bvh_mapping"
-    bl_label = "Reset Mapping List"
-    
-    def execute(self, context):
-        scene = context.scene
-        settings = scene.bvh_mapping_settings
-        settings.mappings.clear()  # Clears all mappings
-        return {'FINISHED'}
-
+# OT_ApplyBVHMapping Operator
 class OT_ApplyBVHMapping(bpy.types.Operator):
     bl_idname = "object.apply_bvh_mapping"
     bl_label = "Apply Mapping"
@@ -259,6 +251,49 @@ class OT_ApplyBVHMapping(bpy.types.Operator):
                     c.inverse_matrix = urdf_b.matrix.inverted()
         
         bpy.context.view_layer.update()
+        return {'FINISHED'}
+
+# OT_AddBVHBone Operator
+class OT_AddBVHBone(bpy.types.Operator):
+    bl_idname = "object.add_urdf_bone"
+    bl_label = "Add URDF Bone"
+    
+    bvh_bone_name: StringProperty()
+
+    def execute(self, context):
+        scene = context.scene
+        settings = scene.bvh_mapping_settings
+        for item in settings.mappings:
+            if item.bvh_bone_name == self.bvh_bone_name:
+                new_bone = item.urdf_bones.add()
+                new_bone.bvh_bone_name = self.bvh_bone_name
+        return {'FINISHED'}
+
+# Operator für das Entfernen von BVH-Bones
+class OT_RemoveBVHBone(bpy.types.Operator):
+    bl_idname = "object.remove_urdf_bone"
+    bl_label = "Remove URDF Bone"
+    
+    bvh_bone_name: StringProperty()
+    index: bpy.props.IntProperty()
+    
+    def execute(self, context):
+        scene = context.scene
+        settings = scene.bvh_mapping_settings
+        for item in settings.mappings:
+            if item.bvh_bone_name == self.bvh_bone_name:
+                item.urdf_bones.remove(self.index)
+        return {'FINISHED'}
+    
+# Operator für das Zurücksetzen der Mapping-Liste
+class OT_ResetBVHMapping(bpy.types.Operator):
+    bl_idname = "object.reset_bvh_mapping"
+    bl_label = "Reset Mapping List"
+    
+    def execute(self, context):
+        scene = context.scene
+        settings = scene.bvh_mapping_settings
+        settings.mappings.clear()  # Alle Mappings zurücksetzen
         return {'FINISHED'}
 
 # ============================================================
@@ -288,17 +323,17 @@ class PANEL_BVHMapping(bpy.types.Panel):
 
         for item in settings.mappings:
             box = layout.box()
-            box.label(text=f"URDF Bones for BVH Bone: {item.bvh_bone_name}")
+            box.label(text=f"BVH Bone: {item.bvh_bone_name}")
 
             for idx, b in enumerate(item.urdf_bones):
                 row = box.row()
                 if scene.bvh_rig_object:
                     row.prop_search(b, "bvh_bone_name", scene.bvh_rig_object.pose, "bones", text="")
-                op = row.operator("object.remove_bvh_bone", text="-")
+                op = row.operator("object.remove_urdf_bone", text="-")
                 op.bvh_bone_name = item.bvh_bone_name
                 op.index = idx
 
-            add_op = box.operator("object.add_bvh_bone", text="+ Add URDF Bone")
+            add_op = box.operator("object.add_urdf_bone", text="+ Add URDF Bone")
             add_op.bvh_bone_name = item.bvh_bone_name
 
 # ============================================================
