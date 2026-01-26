@@ -11,6 +11,7 @@ bl_info = {
 
 import bpy
 import os
+import math
 import mathutils
 from bpy_extras.io_utils import ImportHelper
 import xml.etree.ElementTree as ET
@@ -21,6 +22,7 @@ from bpy.props import (
     IntProperty,
     EnumProperty,
     BoolProperty,
+    FloatVectorProperty,
 )
 from bpy.types import PropertyGroup, Operator, Panel, UIList
 from bpy.app.handlers import persistent
@@ -244,6 +246,7 @@ class BVHMappingBone(PropertyGroup):
 class BVHMappingItem(PropertyGroup):
     urdf_bones: CollectionProperty(type=BVHMappingBone)
     bvh_bone_name: StringProperty(name="BVH Bone")
+    ref_rot: FloatVectorProperty(size=4)
 
 class BVHMappingSettings(PropertyGroup):
     mappings: CollectionProperty(type=BVHMappingItem)
@@ -296,6 +299,69 @@ class OT_GenerateMappingList(Operator):
         settings.active_mapping_index = 0
         settings.active_urdf_index = 0
         return {'FINISHED'}
+    
+def store_pose(pose_bones):
+    return {
+        pb.name: pb.matrix_basis.copy()
+        for pb in pose_bones
+    }
+
+def restore_pose(pose_bones, stored):
+    for pb in pose_bones:
+        if pb.name in stored:
+            pb.matrix_basis = stored[pb.name]
+
+def apply_t_pose(bvh_rig):
+    for pb in bvh_rig.pose.bones:
+        name = pb.name.lower()
+
+        # Einheitliche Rotation
+        pb.rotation_mode = 'XYZ'
+        pb.rotation_euler = (0.0, 0.0, 0.0)
+
+        # --- ARMS ---
+        if any(k in name for k in ("upperarm", "humerus", "shoulder")):
+            # Arme horizontal ausrichten
+            if "left" in name or name.endswith(".l"):
+                pb.rotation_euler.z = math.radians(0)
+            elif "right" in name or name.endswith(".r"):
+                pb.rotation_euler.z = math.radians(0)
+
+        elif any(k in name for k in ("forearm", "lowerarm", "elbow")):
+            # Unterarme folgen der Oberarmrotation
+            if "left" in name or name.endswith(".l"):
+                pb.rotation_euler.z = math.radians(0)
+            elif "right" in name or name.endswith(".r"):
+                pb.rotation_euler.z = math.radians(0)
+
+        elif any(k in name for k in ("hand", "wrist")):
+            # Hände ebenfalls horizontal
+            if "left" in name or name.endswith(".l"):
+                pb.rotation_euler.z = math.radians(90)
+            elif "right" in name or name.endswith(".r"):
+                pb.rotation_euler.z = math.radians(-90)
+
+        # --- LEGS ---
+        elif any(k in name for k in ("thigh", "upperleg", "upleg")):
+            pb.rotation_euler = (0.0, 0.0, 0.0)
+
+        elif any(k in name for k in ("calf", "lowerleg", "shin")):
+            pb.rotation_euler = (0.0, 0.0, 0.0)
+
+        elif "foot" in name or "toe" in name:
+            pb.rotation_euler = (0.0, 0.0, 0.0)
+
+def capture_reference_offsets(scene):
+    settings = scene.bvh_mapping_settings
+    bvh_rig = scene.bvh_rig_object
+
+    for item in settings.mappings:
+        bvh_b = bvh_rig.pose.bones.get(item.bvh_bone_name)
+        if not bvh_b:
+            continue
+
+        q = bvh_b.matrix_basis.to_quaternion()
+        item.ref_rot = (q.w, q.x, q.y, q.z)
 
 class OT_ApplyBVHMapping(bpy.types.Operator):
     bl_idname = "object.apply_bvh_mapping"
@@ -305,6 +371,21 @@ class OT_ApplyBVHMapping(bpy.types.Operator):
         scene = context.scene
         settings = scene.bvh_mapping_settings
         urdf_rig = scene.urdf_rig_object
+        bvh_rig = scene.bvh_rig_object
+
+        current_frame = scene.frame_current
+        scene.frame_set(0)
+
+        if not urdf_rig or not bvh_rig:
+            self.report({'ERROR'}, "URDF or BVH rig missing")
+            return {'CANCELLED'}
+
+        # --- AUTO T-POSE + OFFSET CAPTURE ---
+        stored_pose = store_pose(bvh_rig.pose.bones)
+        apply_t_pose(bvh_rig)
+        capture_reference_offsets(scene)
+        restore_pose(bvh_rig.pose.bones, stored_pose)
+        scene.frame_set(current_frame)
 
         if not urdf_rig:
             self.report({'ERROR'}, "No URDF rig selected")
@@ -375,6 +456,24 @@ class OT_ResetBVHMapping(Operator):
         context.scene.bvh_mapping_settings.active_mapping_index = 0
         context.scene.bvh_mapping_settings.active_urdf_index = 0
         return {'FINISHED'}
+    
+class OT_DebugTPose(Operator):
+    bl_idname = "object.debug_bvh_tpose"
+    bl_label = "Show BVH T-Pose"
+    bl_description = "Temporarily pose the BVH rig into a T-pose for debugging"
+
+    def execute(self, context):
+        scene = context.scene
+        bvh_rig = scene.bvh_rig_object
+
+        if not bvh_rig:
+            self.report({'ERROR'}, "No BVH rig selected")
+            return {'CANCELLED'}
+
+        apply_t_pose(bvh_rig)
+
+        self.report({'INFO'}, "BVH rig posed into T-pose (not captured)")
+        return {'FINISHED'}
 
 # ============================================================
 # N-Panel UI
@@ -400,6 +499,12 @@ class PANEL_BVHMapping(Panel):
         row.operator("object.reset_bvh_mapping", text="Reset")
 
         layout.operator("object.apply_bvh_mapping", text="Apply Mapping")
+
+        layout.operator(
+            "object.debug_bvh_tpose",
+            text="Show BVH T-Pose",
+            icon="ARMATURE_DATA"
+        )
 
         if not settings.mappings:
             layout.label(text="Click 'Generate Mapping List' to show bones.")
@@ -476,20 +581,9 @@ def retarget_frame(scene):
         if not bvh_b:
             continue
 
-        # BVH: Restpose (lokal)
-        M_bvh_rest_local = bvh_b.bone.matrix_local.copy()
-
-        # BVH: aktuelle Pose (lokal relativ zum Parent)
-        M_bvh_pose_world = bvh_b.matrix.copy()
-        if bvh_b.parent:
-            M_bvh_parent_pose_world = bvh_b.parent.matrix.copy()
-            M_bvh_pose_local = M_bvh_parent_pose_world.inverted() @ M_bvh_pose_world
-        else:
-            M_bvh_pose_local = M_bvh_pose_world
-
-        # Delta im BVH-Local-Space
-        Delta = M_bvh_rest_local.inverted() @ M_bvh_pose_local
-        rot_bvh = Delta.to_quaternion()
+        ref_q = mathutils.Quaternion(item.ref_rot)
+        cur_q = bvh_b.matrix_basis.to_quaternion()
+        rot_bvh = ref_q.inverted() @ cur_q
         e_bvh = rot_bvh.to_euler('XYZ')
 
         def get_axis(euler, axis_char):
@@ -536,6 +630,7 @@ classes = [
     OT_RemoveBVHBone,
     OT_ApplyBVHMapping,
     OT_ResetBVHMapping,
+    OT_DebugTPose,
     PANEL_BVHMapping,
     IMPORT_OT_urdf_humanoid,
 ]
