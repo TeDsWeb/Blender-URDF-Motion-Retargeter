@@ -10,6 +10,7 @@ bl_info = {
 
 import bpy
 import os
+import math
 import mathutils
 from bpy_extras.io_utils import ImportHelper
 import xml.etree.ElementTree as ET
@@ -155,10 +156,21 @@ def create_urdf_armature(robot):
         b = link_to_bone[j.child]
         child_mat = link_mats[j.child]
         head = child_mat.to_translation()
-        axis = axis_to_vec(j.axis)
-        tail = head + axis * bone_len
+        # 1. Joint-Origin-Rotation (rpy)
+        joint_rot = mathutils.Euler(j.rpy, 'XYZ').to_matrix()
+
+        # 2. Parent-Link-Rotation (aus link_mats)
+        parent_rot = link_mats[j.parent].to_3x3()
+
+        # 3. URDF-Achse in Weltkoordinaten
+        axis_local = mathutils.Vector(j.axis)
+        axis_world = (parent_rot @ joint_rot @ axis_local).normalized()
+
+        # 4. Bone entlang der WIRKLICHEN Joint-Achse bauen
+        tail = head + axis_world * bone_len
         b.head = head
         b.tail = tail
+        b.align_roll(mathutils.Vector((0,0,1))) # Stabilize roll
         if j.parent in link_to_bone:
             b.parent = link_to_bone[j.parent]
     bpy.ops.object.mode_set(mode='POSE')
@@ -209,6 +221,10 @@ class BVHMappingSettings(PropertyGroup):
     mappings: CollectionProperty(type=BVHMappingItem)
     active_mapping_index: IntProperty(default=0)
     active_urdf_index: IntProperty(default=0)
+    live_retarget: bpy.props.BoolProperty(
+        name="Live Retargeting",
+        default=False
+    )
 
 # UILists
 class UL_BVHMappingList(UIList):
@@ -253,48 +269,21 @@ class OT_GenerateMappingList(Operator):
 
 class OT_ApplyBVHMapping(bpy.types.Operator):
     bl_idname = "object.apply_bvh_mapping"
-    bl_label = "Apply Mapping"
+    bl_label = "Apply Mapping (Setup)"
     
     def execute(self, context):
         scene = context.scene
         settings = scene.bvh_mapping_settings
         urdf_rig = scene.urdf_rig_object
-        bvh_rig = scene.bvh_rig_object
-        if not urdf_rig or not bvh_rig:
+
+        if not urdf_rig:
             return {'CANCELLED'}
-        
-        # 1) Alle alten Constraints auf dem URDF-Rig entfernen
+
+        # 1) Alle alten Constraints entfernen
         for pb in urdf_rig.pose.bones:
             for c in list(pb.constraints):
                 pb.constraints.remove(c)
 
-        
-        # 2) Für jedes Mapping nur COPY_ROTATION im lokalen Raum setzen
-        for item in settings.mappings:
-            bvh_b = bvh_rig.pose.bones.get(item.bvh_bone_name)
-            if not bvh_b:
-                continue
-
-            for b in item.urdf_bones:
-                urdf_b = urdf_rig.pose.bones.get(b.bvh_bone_name)
-                if not urdf_b:
-                    continue
-
-                c = urdf_b.constraints.new("COPY_ROTATION")
-                c.target = bvh_rig
-                c.subtarget = item.bvh_bone_name
-
-                # Nur Rotation, kein Versetzen
-                c.target_space = 'LOCAL'
-                c.owner_space = 'LOCAL'
-
-                # Erstmal alle Achsen aktiv lassen – später können wir pro URDF-Joint filtern
-                c.use_x = True
-                c.use_y = True
-                c.use_z = True
-                c.mix_mode = 'ADD'
-
-        bpy.context.view_layer.update()
         return {'FINISHED'}
 
 class OT_AddBVHBone(Operator):
@@ -359,6 +348,7 @@ class PANEL_BVHMapping(Panel):
 
         layout.prop(scene, "urdf_rig_object")
         layout.prop(scene, "bvh_rig_object")
+        layout.prop(settings, "live_retarget")
 
         row = layout.row()
         row.operator("object.generate_mapping_list", text="Generate Mapping List")
@@ -418,7 +408,7 @@ class IMPORT_OT_urdf_humanoid(Operator, ImportHelper):
         base_path = os.path.dirname(urdf_path)
         robot = parse_urdf(urdf_path)
         urdf_arm, link_mats = create_urdf_armature(robot)
-        bind_meshes(robot, urdf_arm, link_mats, base_path)
+        #bind_meshes(robot, urdf_arm, link_mats, base_path)
         context.scene.urdf_rig_object = urdf_arm
         return {'FINISHED'}
 
@@ -447,6 +437,71 @@ classes = [
 def menu_func_import(self, context):
     self.layout.operator(IMPORT_OT_urdf_humanoid.bl_idname, text="URDF Humanoid (.urdf)")
 
+from mathutils import Matrix
+
+def retarget_frame(scene):
+    settings = scene.bvh_mapping_settings
+    if not getattr(settings, "live_retarget", False):
+        return
+
+    urdf_rig = scene.urdf_rig_object
+    bvh_rig = scene.bvh_rig_object
+    if not urdf_rig or not bvh_rig:
+        return
+
+    for item in settings.mappings:
+        bvh_b = bvh_rig.pose.bones.get(item.bvh_bone_name)
+        if not bvh_b:
+            continue
+
+        for b in item.urdf_bones:
+            urdf_b = urdf_rig.pose.bones.get(b.bvh_bone_name)
+            if not urdf_b:
+                continue
+
+            # --- BVH: Restpose (lokal) ---
+            M_bvh_rest_local = bvh_b.bone.matrix_local.copy()
+
+            # --- BVH: aktuelle Pose (lokal relativ zum Parent) ---
+            M_bvh_pose_world = bvh_b.matrix.copy()
+            if bvh_b.parent:
+                M_bvh_parent_pose_world = bvh_b.parent.matrix.copy()
+                M_bvh_pose_local = M_bvh_parent_pose_world.inverted() @ M_bvh_pose_world
+            else:
+                M_bvh_pose_local = M_bvh_pose_world
+
+            # --- Delta im BVH-Local-Space ---
+            Delta = M_bvh_rest_local.inverted() @ M_bvh_pose_local
+
+            # --- URDF: Restpose (lokal) ---
+            M_urdf_rest_local = urdf_b.bone.matrix_local.copy()
+
+            # --- Zielpose im URDF-Local-Space ---
+            M_urdf_pose_local = M_urdf_rest_local @ Delta
+
+            # --- In Weltkoordinaten bringen ---
+            if urdf_b.parent:
+                M_urdf_parent_pose_world = urdf_b.parent.matrix.copy()
+                M_urdf_pose_world = M_urdf_parent_pose_world @ M_urdf_pose_local
+            else:
+                M_urdf_pose_world = M_urdf_pose_local
+
+            # --- Rotation extrahieren ---
+            rot_urdf = M_urdf_pose_world.to_quaternion()
+            e = rot_urdf.to_euler('XYZ')
+
+            # Roh-Pitch aus BVH (wir wissen: das ist die richtige Achse, aber mit Offset)
+            pitch_raw = -e.x
+
+            # Einmaligen Offset pro Bone merken (erste Frame, an der wir "0" haben wollen)
+            if "bvh_pitch_offset" not in urdf_b:
+                urdf_b["bvh_pitch_offset"] = pitch_raw
+
+            pitch = pitch_raw - urdf_b["bvh_pitch_offset"]
+
+            # Nur um die URDF-Pitch-Achse drehen (Y)
+            urdf_b.rotation_euler = (0.0, pitch, 0.0)
+
 def register():
     for cls in classes:
         try:
@@ -457,9 +512,12 @@ def register():
     bpy.types.Scene.urdf_rig_object = PointerProperty(name="URDF Rig", type=bpy.types.Object)
     bpy.types.Scene.bvh_rig_object = PointerProperty(name="BVH Rig", type=bpy.types.Object)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
+    bpy.app.handlers.frame_change_post.append(retarget_frame)
 
 def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+    bpy.app.handlers.frame_change_post.remove(retarget_frame)
+
     del bpy.types.Scene.bvh_mapping_settings
     del bpy.types.Scene.urdf_rig_object
     del bpy.types.Scene.bvh_rig_object
