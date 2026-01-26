@@ -294,7 +294,7 @@ class OT_GenerateMappingList(Operator):
         settings.active_urdf_index = 0
         return {'FINISHED'}
 
-class OT_ApplyBVHMapping(Operator):
+class OT_ApplyBVHMapping(bpy.types.Operator):
     bl_idname = "object.apply_bvh_mapping"
     bl_label = "Apply Mapping (Setup)"
     
@@ -304,12 +304,26 @@ class OT_ApplyBVHMapping(Operator):
         urdf_rig = scene.urdf_rig_object
 
         if not urdf_rig:
+            self.report({'ERROR'}, "No URDF rig selected")
             return {'CANCELLED'}
 
+        # 1) Alle alten Constraints entfernen
         for pb in urdf_rig.pose.bones:
             for c in list(pb.constraints):
                 pb.constraints.remove(c)
 
+        # 2) Alle Offsets zurücksetzen
+        for pb in urdf_rig.pose.bones:
+            if "offset" in pb:
+                del pb["offset"]
+
+        # 3) Live Retarget aktivieren
+        settings.live_retarget = True
+
+        # 4) Einmaliges Retargeting ausführen
+        retarget_frame(scene)
+
+        self.report({'INFO'}, "Mapping applied and offsets reset")
         return {'FINISHED'}
 
 class OT_AddBVHBone(Operator):
