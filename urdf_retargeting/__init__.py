@@ -237,6 +237,12 @@ class BVHMappingBone(PropertyGroup):
         items=sign_items,
         default='NEG',
     )
+    neutral_offset: bpy.props.FloatProperty(
+        name="Neutral Offset",
+        description="Correction of neutral pose in degrees",
+        default=0.0,
+        subtype='ANGLE'
+    )
 
 class BVHMappingItem(PropertyGroup):
     urdf_bones: CollectionProperty(type=BVHMappingBone)
@@ -251,6 +257,13 @@ class BVHMappingSettings(PropertyGroup):
     live_retarget: BoolProperty(
         name="Live Retargeting",
         default=False
+    )
+    smoothing: bpy.props.FloatProperty(
+        name="Smoothing",
+        description="Smoothing factor for retargeting",
+        default=0.25,
+        min=0.0,
+        max=1.0
     )
 
 # UILists
@@ -274,6 +287,7 @@ class UL_URDFBoneList(UIList):
             row.label(text=item.bvh_bone_name or "<URDF Bone>")
         row.prop(item, "source_axis", text="")
         row.prop(item, "sign", text="")
+        row.prop(item, "neutral_offset", text="")
 
 # Operators
 class OT_GenerateMappingList(Operator):
@@ -540,6 +554,7 @@ class PANEL_BVHMapping(Panel):
         layout.prop(scene, "urdf_rig_object")
         layout.prop(scene, "bvh_rig_object")
         layout.prop(settings, "live_retarget")
+        layout.prop(settings, "smoothing")
 
         row = layout.row()
         row.operator("object.generate_mapping_list", text="Generate Mapping List")
@@ -630,19 +645,36 @@ def retarget_frame(scene):
     if not urdf_rig or not bvh_rig:
         return
 
+    # Globaler Euler-Cache für Stabilisierung
+    if "_prev_euler_cache" not in scene:
+        scene["_prev_euler_cache"] = {}
+    cache = scene["_prev_euler_cache"]
+
     for item in settings.mappings:
         bvh_b = bvh_rig.pose.bones.get(item.bvh_bone_name)
         if not bvh_b:
             continue
 
+        # T-Pose Referenzrotation (Quaternion)
         ref_q = mathutils.Quaternion(item.ref_rot)
         if ref_q == mathutils.Quaternion((0,0,0,0)):
             continue
 
+        # Aktuelle BVH-Rotation (Quaternion)
         cur_q = bvh_b.matrix_basis.to_quaternion()
-        rot_bvh = ref_q.inverted() @ cur_q
-        e_bvh = rot_bvh.to_euler('XYZ')
 
+        # Bewegung relativ zur T-Pose
+        rot_bvh = ref_q.inverted() @ cur_q
+
+        # Stabilisierte Euler-Winkel NUR zur Achsenextraktion
+        e = rot_bvh.to_euler('XYZ')
+
+        bone_key = f"{bvh_rig.name}:{bvh_b.name}"
+        if bone_key in cache:
+            e.make_compatible(cache[bone_key])
+        cache[bone_key] = e.copy()
+
+        # Achsenextraktion
         def get_axis(euler, axis_char):
             if axis_char == 'X':
                 return euler.x
@@ -657,16 +689,34 @@ def retarget_frame(scene):
             if not urdf_b:
                 continue
 
-            value = get_axis(e_bvh, b.source_axis)
+            # UI-Achse auswählen
+            value = get_axis(e, b.source_axis)
+
+            # Vorzeichen aus UI
             if b.sign == 'NEG':
                 value = -value
 
+            # URDF-Offset anwenden
             key = "offset"
             if key not in urdf_b:
                 urdf_b[key] = value
             value -= urdf_b[key]
 
-            urdf_b.rotation_euler = (0.0, value, 0.0)
+            # Neutral-Offset aus UI (in Radiant)
+            neutral = b.neutral_offset
+            value += neutral
+
+            # Zielrotation NUR um Y-Achse (Quaternion)
+            target_q = mathutils.Euler((0.0, value, 0.0), 'XYZ').to_quaternion()
+
+            # Glättung (Slerp)
+            alpha = settings.smoothing
+            old_q = urdf_b.rotation_quaternion.copy()
+            smoothed_q = old_q.slerp(target_q, alpha)
+
+            # Rotation setzen (Quaternion-only)
+            urdf_b.rotation_mode = 'QUATERNION'
+            urdf_b.rotation_quaternion = smoothed_q
 
 # ============================================================
 # REGISTER
