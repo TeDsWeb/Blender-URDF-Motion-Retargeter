@@ -4,7 +4,7 @@ bl_info = {
     "version": (1, 0, 0),
     "blender": (5, 0, 0),
     "location": "File > Import > URDF Humanoid",
-    "description": "URDF Import + BVH mapping with interactive N-Panel (BVH → URDF) using UILists",
+    "description": "URDF Import + BVH mapping with joint limits and interactive N-Panel",
     "category": "Import-Export",
     "type": "add-on",
 }
@@ -28,10 +28,11 @@ from bpy.props import (
 from bpy.types import PropertyGroup, Operator, Panel, UIList
 from bpy.app.handlers import persistent
 
-
 # ============================================================
 # URDF DATA STRUCTURES & PARSER
 # ============================================================
+
+
 class URDFVisual:
     def __init__(self, xyz, rpy, mesh):
         self.xyz = xyz
@@ -46,7 +47,18 @@ class URDFLink:
 
 
 class URDFJoint:
-    def __init__(self, name, jtype, parent, child, xyz, rpy, axis):
+    def __init__(
+        self,
+        name,
+        jtype,
+        parent,
+        child,
+        xyz,
+        rpy,
+        axis,
+        limit_lower=None,
+        limit_upper=None,
+    ):
         self.name = name
         self.type = jtype
         self.parent = parent
@@ -54,6 +66,8 @@ class URDFJoint:
         self.xyz = xyz
         self.rpy = rpy
         self.axis = axis
+        self.limit_lower = limit_lower
+        self.limit_upper = limit_upper
 
 
 class URDFRobot:
@@ -64,6 +78,7 @@ class URDFRobot:
 
 
 def parse_float_list(s, n):
+    """Parses a string of space/comma separated floats."""
     if s is None:
         return [0.0] * n
     parts = s.replace(",", " ").split()
@@ -79,9 +94,12 @@ def parse_float_list(s, n):
 
 
 def parse_urdf(path):
+    """Parses the URDF XML file into a URDFRobot structure."""
     tree = ET.parse(path)
     root = tree.getroot()
     robot = URDFRobot(root.attrib.get("name", "URDF_Robot"))
+
+    # Parse Links
     for link_el in root.findall("link"):
         link = URDFLink(link_el.attrib["name"])
         for vis_el in link_el.findall("visual"):
@@ -98,6 +116,8 @@ def parse_urdf(path):
             if mesh:
                 link.visuals.append(URDFVisual(xyz, rpy, mesh))
         robot.links[link.name] = link
+
+    # Parse Joints
     for idx, joint_el in enumerate(root.findall("joint")):
         name = joint_el.attrib.get("name", "joint_%03d" % idx)
         jtype = joint_el.attrib.get("type", "fixed")
@@ -110,20 +130,40 @@ def parse_urdf(path):
         axis = parse_float_list(
             axis_el.attrib.get("xyz") if axis_el is not None else None, 3
         )
-        robot.joints[name] = URDFJoint(name, jtype, parent, child, xyz, rpy, axis)
+
+        # New: Extract Joint Limits
+        limit_el = joint_el.find("limit")
+        lower = (
+            float(limit_el.attrib.get("lower", -3.14159))
+            if limit_el is not None
+            else None
+        )
+        upper = (
+            float(limit_el.attrib.get("upper", 3.14159))
+            if limit_el is not None
+            else None
+        )
+
+        robot.joints[name] = URDFJoint(
+            name, jtype, parent, child, xyz, rpy, axis, lower, upper
+        )
     return robot
 
 
 # ============================================================
 # UTILITY & BUILDING
 # ============================================================
+
+
 def origin_to_matrix(xyz, rpy):
+    """Converts URDF origin (xyz, rpy) to a 4x4 Transformation Matrix."""
     loc = mathutils.Vector(xyz)
     rot = mathutils.Euler(rpy, "XYZ").to_matrix().to_4x4()
     return mathutils.Matrix.Translation(loc) @ rot
 
 
 def build_link_transforms(robot):
+    """Computes world matrices for all links in their default pose."""
     children = {}
     joint_by_child = {}
     for j in robot.joints.values():
@@ -132,6 +172,7 @@ def build_link_transforms(robot):
     all_links = set(l.name for l in robot.links.values())
     roots = list(all_links - set(joint_by_child.keys()))
     root = roots[0] if roots else list(all_links)[0]
+
     mats = {root: mathutils.Matrix.Identity(4)}
     stack = [root]
     while stack:
@@ -143,14 +184,17 @@ def build_link_transforms(robot):
 
 
 def create_urdf_armature(robot):
+    """Creates a Blender armature based on URDF joint structure."""
     link_mats, root = build_link_transforms(robot)
     bpy.ops.object.add(type="ARMATURE", enter_editmode=True)
     arm_obj = bpy.context.object
     arm_obj.name = f"{robot.name}_Rig"
     bones = arm_obj.data.edit_bones
+
     link_to_bone = {}
     for link_name in link_mats:
         link_to_bone[link_name] = bones.new(link_name)
+
     for j in robot.joints.values():
         b = link_to_bone.get(j.child)
         if b:
@@ -163,11 +207,23 @@ def create_urdf_armature(robot):
             b.tail = head + axis_world * 0.05
             if j.parent in link_to_bone:
                 b.parent = link_to_bone[j.parent]
+
     bpy.ops.object.mode_set(mode="OBJECT")
+
+    # Store Joint Limits in PoseBones for the engine
+    for j_name, j in robot.joints.items():
+        if j.child in arm_obj.pose.bones:
+            pb = arm_obj.pose.bones[j.child]
+            if j.limit_lower is not None:
+                pb["limit_lower"] = j.limit_lower
+            if j.limit_upper is not None:
+                pb["limit_upper"] = j.limit_upper
+
     return arm_obj, link_mats
 
 
 def bind_meshes(robot, arm_obj, link_mats, base_path):
+    """Imports meshes and parents them to bones with correct offsets."""
     for link_name, link in robot.links.items():
         for idx, vis in enumerate(link.visuals):
             mesh_raw = vis.mesh.replace("package://", "")
@@ -175,7 +231,7 @@ def bind_meshes(robot, arm_obj, link_mats, base_path):
             if not os.path.exists(mesh_path):
                 continue
 
-            # Import je nach Dateiendung
+            # Import based on file extension
             ext = os.path.splitext(mesh_path)[1].lower()
             if ext == ".stl":
                 bpy.ops.wm.stl_import(filepath=mesh_path)
@@ -188,15 +244,15 @@ def bind_meshes(robot, arm_obj, link_mats, base_path):
                 obj = bpy.context.selected_objects[0]
                 obj.name = f"{link_name}_mesh_{idx}"
 
-                # Welt-Matrix aus URDF berechnen
+                # Calculate target world matrix from URDF
                 target_mtx = link_mats[link_name] @ origin_to_matrix(vis.xyz, vis.rpy)
 
-                # Binden an Bone (Fixiert die "merkwürdigen Offsets")
+                # Parent to Bone (Fixes weird offsets)
                 obj.parent = arm_obj
                 if link_name in arm_obj.pose.bones:
                     obj.parent_type = "BONE"
                     obj.parent_bone = link_name
-                    # Die Inverse-Matrix sorgt dafür, dass das Mesh trotz Bone-Rotation am richtigen Ort bleibt
+                    # Parent inverse ensures the mesh stays in place relative to bone position
                     bone_mtx_world = (
                         arm_obj.matrix_world @ arm_obj.pose.bones[link_name].matrix
                     )
@@ -208,6 +264,8 @@ def bind_meshes(robot, arm_obj, link_mats, base_path):
 # ============================================================
 # DATA STRUCTURES
 # ============================================================
+
+
 class BVHMappingBone(PropertyGroup):
     bvh_bone_name: StringProperty(name="URDF Bone")
     source_axis: EnumProperty(
@@ -239,10 +297,12 @@ class BVHMappingSettings(PropertyGroup):
 # ============================================================
 # ENGINE & UI
 # ============================================================
+
+
 @persistent
 def retarget_frame(scene):
-    set = scene.bvh_mapping_settings
-    if not set.live_retarget:
+    settings = scene.bvh_mapping_settings
+    if not settings.live_retarget:
         return
     urdf = scene.urdf_rig_object
     bvh = scene.bvh_rig_object
@@ -252,11 +312,11 @@ def retarget_frame(scene):
     # 1. Root Motion (Object Level)
     if bvh.pose.bones:
         bvh_root = bvh.matrix_world @ bvh.pose.bones[0].matrix
-        urdf.location = (bvh_root.to_translation() * set.root_scale) + mathutils.Vector(
-            set.location_offset
-        )
-        if set.transfer_root_rot:
-            off_q = mathutils.Euler(set.rotation_offset).to_quaternion()
+        urdf.location = (
+            bvh_root.to_translation() * settings.root_scale
+        ) + mathutils.Vector(settings.location_offset)
+        if settings.transfer_root_rot:
+            off_q = mathutils.Euler(settings.rotation_offset).to_quaternion()
             urdf.rotation_mode = "QUATERNION"
             urdf.rotation_quaternion = bvh_root.to_quaternion() @ off_q
 
@@ -265,10 +325,11 @@ def retarget_frame(scene):
         scene["_prev_euler_cache"] = {}
     cache = scene["_prev_euler_cache"]
 
-    for item in set.mappings:
+    for item in settings.mappings:
         bvh_b = bvh.pose.bones.get(item.bvh_bone_name)
         if not bvh_b:
             continue
+
         ref_q = mathutils.Quaternion(item.ref_rot)
         rot_rel = ref_q.inverted() @ bvh_b.matrix_basis.to_quaternion()
         e = rot_rel.to_euler("XYZ")
@@ -288,21 +349,26 @@ def retarget_frame(scene):
                 val = -val
 
             # --- NEUTRAL POSE FIX ---
-            # Wir speichern den Wert des ersten Frames als Basis-Offset
+            # Store the first frame's value as a base offset
             if "offset" not in urdf_b:
                 urdf_b["offset"] = val
 
-            # Der resultierende Winkel ist die Differenz zum Start + User Korrektur
+            # Resulting angle is the difference from start + manual user correction
             final_angle = val - urdf_b["offset"] + b.neutral_offset
+
+            # --- JOINT LIMITS CLAMPING ---
+            l_min = urdf_b.get("limit_lower", -3.14159)
+            l_max = urdf_b.get("limit_upper", 3.14159)
+            final_angle = max(min(final_angle, l_max), l_min)
 
             target_q = mathutils.Euler((0, final_angle, 0)).to_quaternion()
             urdf_b.rotation_mode = "QUATERNION"
             urdf_b.rotation_quaternion = urdf_b.rotation_quaternion.slerp(
-                target_q, set.smoothing
+                target_q, settings.smoothing
             )
 
 
-# (UI & Operators Klassen hier analog zum vorherigen Stand...)
+# UI Implementation
 class UL_BVHMappingList(UIList):
     def draw_item(
         self, context, layout, data, item, icon, active_data, active_propname, index
@@ -333,33 +399,38 @@ class PANEL_BVHMapping(Panel):
     bl_idname = "VIEW3D_PT_urdf_mapping"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "BVH → URDF Retargeting"
+    bl_category = "BVH -> URDF Retargeting"
 
     def draw(self, context):
         layout = self.layout
         s = context.scene
-        set = s.bvh_mapping_settings
+        settings = s.bvh_mapping_settings
         layout.prop(s, "urdf_rig_object")
         layout.prop(s, "bvh_rig_object")
 
         box = layout.box()
-        box.label(text="BVH → URDF Root Options")
-        box.prop(set, "root_scale")
-        box.prop(set, "transfer_root_rot")
-        box.prop(set, "location_offset")
-        box.prop(set, "rotation_offset")
+        box.label(text="BVH -> URDF Root Options")
+        box.prop(settings, "root_scale")
+        box.prop(settings, "transfer_root_rot")
+        box.prop(settings, "location_offset")
+        box.prop(settings, "rotation_offset")
 
-        layout.prop(set, "smoothing")
-        layout.prop(set, "live_retarget", toggle=True)
+        layout.prop(settings, "smoothing")
+        layout.prop(settings, "live_retarget", toggle=True)
         layout.operator("object.generate_mapping_list")
         layout.operator("object.apply_bvh_mapping")
 
-        if set.mappings:
+        if settings.mappings:
             layout.template_list(
-                "UL_BVHMappingList", "", set, "mappings", set, "active_mapping_index"
+                "UL_BVHMappingList",
+                "",
+                settings,
+                "mappings",
+                settings,
+                "active_mapping_index",
             )
-            if 0 <= set.active_mapping_index < len(set.mappings):
-                active = set.mappings[set.active_mapping_index]
+            if 0 <= settings.active_mapping_index < len(settings.mappings):
+                active = settings.mappings[settings.active_mapping_index]
                 box = layout.box()
                 row = box.row()
                 row.template_list(
@@ -367,7 +438,7 @@ class PANEL_BVHMapping(Panel):
                     "",
                     active,
                     "urdf_bones",
-                    set,
+                    settings,
                     "active_urdf_index",
                 )
                 col = row.column(align=True)
@@ -399,7 +470,7 @@ class OT_ApplyBVHMapping(Operator):
     bl_label = "Apply Mapping"
 
     def execute(self, context):
-        # Reset Offsets
+        # Reset Calibration Offsets
         if context.scene.urdf_rig_object:
             for pb in context.scene.urdf_rig_object.pose.bones:
                 if "offset" in pb:
