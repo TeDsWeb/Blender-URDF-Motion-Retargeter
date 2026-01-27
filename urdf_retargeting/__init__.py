@@ -4,13 +4,15 @@ bl_info = {
     "version": (1, 0, 0),
     "blender": (5, 0, 0),
     "location": "File > Import > URDF Humanoid",
-    "description": "URDF Import + BVH mapping with joint limits and interactive N-Panel",
+    "description": "URDF Import + BVH mapping with beyond_mimic export",
     "category": "Import-Export",
     "type": "add-on",
 }
 
 import bpy
 import os
+import csv
+import json
 import math
 import mathutils
 from bpy_extras.io_utils import ImportHelper
@@ -99,7 +101,6 @@ def parse_urdf(path):
     root = tree.getroot()
     robot = URDFRobot(root.attrib.get("name", "URDF_Robot"))
 
-    # Parse Links
     for link_el in root.findall("link"):
         link = URDFLink(link_el.attrib["name"])
         for vis_el in link_el.findall("visual"):
@@ -117,7 +118,6 @@ def parse_urdf(path):
                 link.visuals.append(URDFVisual(xyz, rpy, mesh))
         robot.links[link.name] = link
 
-    # Parse Joints
     for idx, joint_el in enumerate(root.findall("joint")):
         name = joint_el.attrib.get("name", "joint_%03d" % idx)
         jtype = joint_el.attrib.get("type", "fixed")
@@ -130,8 +130,6 @@ def parse_urdf(path):
         axis = parse_float_list(
             axis_el.attrib.get("xyz") if axis_el is not None else None, 3
         )
-
-        # New: Extract Joint Limits
         limit_el = joint_el.find("limit")
         lower = (
             float(limit_el.attrib.get("lower", -3.14159))
@@ -143,7 +141,6 @@ def parse_urdf(path):
             if limit_el is not None
             else None
         )
-
         robot.joints[name] = URDFJoint(
             name, jtype, parent, child, xyz, rpy, axis, lower, upper
         )
@@ -151,7 +148,7 @@ def parse_urdf(path):
 
 
 # ============================================================
-# UTILITY & BUILDING
+# BUILDING & BINDING
 # ============================================================
 
 
@@ -172,7 +169,6 @@ def build_link_transforms(robot):
     all_links = set(l.name for l in robot.links.values())
     roots = list(all_links - set(joint_by_child.keys()))
     root = roots[0] if roots else list(all_links)[0]
-
     mats = {root: mathutils.Matrix.Identity(4)}
     stack = [root]
     while stack:
@@ -190,11 +186,7 @@ def create_urdf_armature(robot):
     arm_obj = bpy.context.object
     arm_obj.name = f"{robot.name}_Rig"
     bones = arm_obj.data.edit_bones
-
-    link_to_bone = {}
-    for link_name in link_mats:
-        link_to_bone[link_name] = bones.new(link_name)
-
+    link_to_bone = {link_name: bones.new(link_name) for link_name in link_mats}
     for j in robot.joints.values():
         b = link_to_bone.get(j.child)
         if b:
@@ -203,14 +195,10 @@ def create_urdf_armature(robot):
             axis_world = (
                 link_mats[j.parent].to_3x3() @ joint_rot @ mathutils.Vector(j.axis)
             ).normalized()
-            b.head = head
-            b.tail = head + axis_world * 0.05
+            b.head, b.tail = head, head + axis_world * 0.05
             if j.parent in link_to_bone:
                 b.parent = link_to_bone[j.parent]
-
     bpy.ops.object.mode_set(mode="OBJECT")
-
-    # Store Joint Limits in PoseBones for the engine
     for j_name, j in robot.joints.items():
         if j.child in arm_obj.pose.bones:
             pb = arm_obj.pose.bones[j.child]
@@ -218,7 +206,6 @@ def create_urdf_armature(robot):
                 pb["limit_lower"] = j.limit_lower
             if j.limit_upper is not None:
                 pb["limit_upper"] = j.limit_upper
-
     return arm_obj, link_mats
 
 
@@ -230,8 +217,6 @@ def bind_meshes(robot, arm_obj, link_mats, base_path):
             mesh_path = os.path.normpath(os.path.join(base_path, mesh_raw))
             if not os.path.exists(mesh_path):
                 continue
-
-            # Import based on file extension
             ext = os.path.splitext(mesh_path)[1].lower()
             if ext == ".stl":
                 bpy.ops.wm.stl_import(filepath=mesh_path)
@@ -239,25 +224,17 @@ def bind_meshes(robot, arm_obj, link_mats, base_path):
                 bpy.ops.wm.obj_import(filepath=mesh_path)
             elif ext == ".dae":
                 bpy.ops.wm.collada_import(filepath=mesh_path)
-
             if bpy.context.selected_objects:
                 obj = bpy.context.selected_objects[0]
                 obj.name = f"{link_name}_mesh_{idx}"
-
-                # Calculate target world matrix from URDF
                 target_mtx = link_mats[link_name] @ origin_to_matrix(vis.xyz, vis.rpy)
-
-                # Parent to Bone (Fixes weird offsets)
                 obj.parent = arm_obj
                 if link_name in arm_obj.pose.bones:
-                    obj.parent_type = "BONE"
-                    obj.parent_bone = link_name
-                    # Parent inverse ensures the mesh stays in place relative to bone position
+                    obj.parent_type, obj.parent_bone = "BONE", link_name
                     bone_mtx_world = (
                         arm_obj.matrix_world @ arm_obj.pose.bones[link_name].matrix
                     )
                     obj.matrix_parent_inverse = bone_mtx_world.inverted()
-
                 obj.matrix_world = target_mtx
 
 
@@ -287,15 +264,16 @@ class BVHMappingSettings(PropertyGroup):
     active_urdf_index: IntProperty()
     live_retarget: BoolProperty(name="Live Retargeting")
     smoothing: FloatProperty(name="Smoothing", default=0.25, min=0, max=1)
-    # Root Motion Settings
     root_scale: FloatProperty(name="Root Scale", default=1.0)
     location_offset: FloatVectorProperty(name="Loc Offset", subtype="TRANSLATION")
     rotation_offset: FloatVectorProperty(name="Rot Offset", subtype="EULER")
     transfer_root_rot: BoolProperty(name="Transfer World Rotation", default=True)
+    target_hz: IntProperty(name="Export Hz", default=50, min=1, max=240)
+    auto_grounding: BoolProperty(name="Auto Grounding", default=True)
 
 
 # ============================================================
-# ENGINE & UI
+# RETARGETING ENGINE
 # ============================================================
 
 
@@ -304,12 +282,10 @@ def retarget_frame(scene):
     settings = scene.bvh_mapping_settings
     if not settings.live_retarget:
         return
-    urdf = scene.urdf_rig_object
-    bvh = scene.bvh_rig_object
+    urdf, bvh = scene.urdf_rig_object, scene.bvh_rig_object
     if not urdf or not bvh:
         return
 
-    # 1. Root Motion (Object Level)
     if bvh.pose.bones:
         bvh_root = bvh.matrix_world @ bvh.pose.bones[0].matrix
         urdf.location = (
@@ -317,10 +293,11 @@ def retarget_frame(scene):
         ) + mathutils.Vector(settings.location_offset)
         if settings.transfer_root_rot:
             off_q = mathutils.Euler(settings.rotation_offset).to_quaternion()
-            urdf.rotation_mode = "QUATERNION"
-            urdf.rotation_quaternion = bvh_root.to_quaternion() @ off_q
+            urdf.rotation_mode, urdf.rotation_quaternion = (
+                "QUATERNION",
+                bvh_root.to_quaternion() @ off_q,
+            )
 
-    # 2. Bone Rotations & Neutral Pose Fix
     if "_prev_euler_cache" not in scene:
         scene["_prev_euler_cache"] = {}
     cache = scene["_prev_euler_cache"]
@@ -329,11 +306,9 @@ def retarget_frame(scene):
         bvh_b = bvh.pose.bones.get(item.bvh_bone_name)
         if not bvh_b:
             continue
-
         ref_q = mathutils.Quaternion(item.ref_rot)
         rot_rel = ref_q.inverted() @ bvh_b.matrix_basis.to_quaternion()
         e = rot_rel.to_euler("XYZ")
-
         key = f"{bvh.name}:{bvh_b.name}"
         if key in cache:
             e.make_compatible(cache[key])
@@ -343,24 +318,16 @@ def retarget_frame(scene):
             urdf_b = urdf.pose.bones.get(b.bvh_bone_name)
             if not urdf_b:
                 continue
-
             val = getattr(e, b.source_axis.lower())
             if b.sign == "NEG":
                 val = -val
-
-            # --- NEUTRAL POSE FIX ---
-            # Store the first frame's value as a base offset
             if "offset" not in urdf_b:
                 urdf_b["offset"] = val
-
-            # Resulting angle is the difference from start + manual user correction
             final_angle = val - urdf_b["offset"] + b.neutral_offset
-
-            # --- JOINT LIMITS CLAMPING ---
-            l_min = urdf_b.get("limit_lower", -3.14159)
-            l_max = urdf_b.get("limit_upper", 3.14159)
+            l_min, l_max = urdf_b.get("limit_lower", -3.14), urdf_b.get(
+                "limit_upper", 3.14
+            )
             final_angle = max(min(final_angle, l_max), l_min)
-
             target_q = mathutils.Euler((0, final_angle, 0)).to_quaternion()
             urdf_b.rotation_mode = "QUATERNION"
             urdf_b.rotation_quaternion = urdf_b.rotation_quaternion.slerp(
@@ -368,7 +335,142 @@ def retarget_frame(scene):
             )
 
 
-# UI Implementation
+# ============================================================
+# EXPORT OPERATOR (DIR Selection + Dual File Output)
+# ============================================================
+
+
+class OT_ExportBeyondMimic(Operator):
+    """Exports both CSV trajectory and JSON metadata with time-based resampling."""
+
+    bl_idname = "object.export_beyond_mimic"
+    bl_label = "Export CSV & JSON"
+    bl_description = "Select directory; files will be named after the Source BVH rig and resampled to Target Hz"
+
+    directory: StringProperty(name="Export Directory", subtype="DIR_PATH")
+
+    def execute(self, context):
+        scene = context.scene
+        settings = scene.bvh_mapping_settings
+        urdf, bvh = scene.urdf_rig_object, scene.bvh_rig_object
+
+        if not urdf or not bvh or not self.directory:
+            self.report({"ERROR"}, "Robot, BVH Rig or Directory missing!")
+            return {"CANCELLED"}
+
+        # 1. Prepare Paths
+        base_name = bpy.path.clean_name(bvh.name)
+        csv_path = os.path.join(self.directory, f"{base_name}.csv")
+        json_path = os.path.join(self.directory, f"{base_name}_meta.json")
+
+        # 2. Resampling Setup
+        # Calculate total duration in seconds
+        fps = scene.render.fps
+        total_frames = scene.frame_end - scene.frame_start
+        duration = total_frames / fps
+
+        # Calculate total steps based on target Hz
+        target_hz = settings.target_hz
+        num_steps = int(duration * target_hz) + 1
+        time_per_step = 1.0 / target_hz
+
+        joints = [pb.name for pb in urdf.pose.bones]
+        header = [
+            "root_tx",
+            "root_ty",
+            "root_tz",
+            "root_qx",
+            "root_qy",
+            "root_qz",
+            "root_qw",
+        ] + joints
+
+        data_rows, meta_joints = [], {}
+        orig_f = scene.frame_current
+
+        # 3. Sampling Loop (Time-based Resampling)
+        for step in range(num_steps):
+            # Calculate current time in seconds
+            current_time_secs = step * time_per_step
+
+            # Map time back to Blender frames (including subframes for precision)
+            blender_frame = scene.frame_start + (current_time_secs * fps)
+
+            # Set frame and subframe (crucial for smooth interpolation)
+            scene.frame_set(int(blender_frame), subframe=blender_frame % 1.0)
+
+            if settings.auto_grounding:
+                min_z = min((urdf.matrix_world @ pb.head).z for pb in urdf.pose.bones)
+                urdf.location.z -= min_z
+
+            # Collect Root Data
+            row = [
+                urdf.location.x,
+                urdf.location.y,
+                urdf.location.z,
+                urdf.rotation_quaternion.x,
+                urdf.rotation_quaternion.y,
+                urdf.rotation_quaternion.z,
+                urdf.rotation_quaternion.w,
+            ]
+
+            # Collect Joint Data
+            for j in joints:
+                pb = urdf.pose.bones[j]
+                row.append(pb.rotation_quaternion.to_euler("XYZ").y)
+
+                # Metadata (limits) only needed once
+                if step == 0:
+                    meta_joints[j] = {
+                        "lower": pb.get("limit_lower", -3.14),
+                        "upper": pb.get("limit_upper", 3.14),
+                    }
+
+            data_rows.append(row)
+
+        # 4. Write Files
+        try:
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                writer.writerows(data_rows)
+
+            with open(json_path, "w") as f:
+                json.dump(
+                    {
+                        "source_fps": fps,
+                        "export_hz": target_hz,
+                        "duration_secs": duration,
+                        "total_samples": len(data_rows),
+                        "joints": joints,
+                        "limits": meta_joints,
+                    },
+                    f,
+                    indent=4,
+                )
+
+            self.report(
+                {"INFO"},
+                f"Resampled to {target_hz}Hz: {base_name}.csv and {base_name}_meta.json",
+            )
+
+        except Exception as e:
+            self.report({"ERROR"}, f"File Error: {str(e)}")
+            return {"CANCELLED"}
+
+        scene.frame_set(orig_f)
+        return {"FINISHED"}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+
+# ============================================================
+# UI IMPLEMENTATION
+# ============================================================
+
+
 class UL_BVHMappingList(UIList):
     def draw_item(
         self, context, layout, data, item, icon, active_data, active_propname, index
@@ -399,7 +501,7 @@ class PANEL_BVHMapping(Panel):
     bl_idname = "VIEW3D_PT_urdf_mapping"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "BVH -> URDF Retargeting"
+    bl_category = "BVH → URDF Retargeting"
 
     def draw(self, context):
         layout = self.layout
@@ -409,17 +511,15 @@ class PANEL_BVHMapping(Panel):
         layout.prop(s, "bvh_rig_object")
 
         box = layout.box()
-        box.label(text="BVH -> URDF Root Options")
+        box.label(text="BVH → URDF Options")
         box.prop(settings, "root_scale")
         box.prop(settings, "transfer_root_rot")
         box.prop(settings, "location_offset")
         box.prop(settings, "rotation_offset")
+        box.prop(settings, "smoothing")
 
-        layout.prop(settings, "smoothing")
         layout.prop(settings, "live_retarget", toggle=True)
         layout.operator("object.generate_mapping_list")
-        layout.operator("object.apply_bvh_mapping")
-
         if settings.mappings:
             layout.template_list(
                 "UL_BVHMappingList",
@@ -448,20 +548,33 @@ class PANEL_BVHMapping(Panel):
                 col.operator(
                     "object.remove_urdf_bone", text="", icon="REMOVE"
                 ).bvh_bone_name = active.bvh_bone_name
+        layout.operator("object.apply_bvh_mapping")
+
+        layout.separator()
+        box = layout.box()
+        box.label(text="Export Beyond Mimic", icon="EXPORT")
+        box.prop(settings, "target_hz")
+        box.prop(settings, "auto_grounding")
+        box.operator("object.export_beyond_mimic", text="Export")
 
 
-# Helper Operators
+# ============================================================
+# OPERATORS & REGISTRATION
+# ============================================================
+
+
 class OT_GenerateMappingList(Operator):
     bl_idname = "object.generate_mapping_list"
     bl_label = "Generate Mapping List"
 
     def execute(self, context):
         bvh = context.scene.bvh_rig_object
-        if not bvh:
-            return {"CANCELLED"}
-        context.scene.bvh_mapping_settings.mappings.clear()
-        for pb in bvh.pose.bones:
-            context.scene.bvh_mapping_settings.mappings.add().bvh_bone_name = pb.name
+        if bvh:
+            context.scene.bvh_mapping_settings.mappings.clear()
+            for pb in bvh.pose.bones:
+                context.scene.bvh_mapping_settings.mappings.add().bvh_bone_name = (
+                    pb.name
+                )
         return {"FINISHED"}
 
 
@@ -470,7 +583,6 @@ class OT_ApplyBVHMapping(Operator):
     bl_label = "Apply Mapping"
 
     def execute(self, context):
-        # Reset Calibration Offsets
         if context.scene.urdf_rig_object:
             for pb in context.scene.urdf_rig_object.pose.bones:
                 if "offset" in pb:
@@ -539,6 +651,7 @@ classes = [
     OT_ApplyBVHMapping,
     OT_AddBVHBone,
     OT_RemoveBVHBone,
+    OT_ExportBeyondMimic,
     IMPORT_OT_urdf_humanoid,
 ]
 
