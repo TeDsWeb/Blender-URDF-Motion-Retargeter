@@ -226,17 +226,12 @@ sign_items = [
 ]
 
 class BVHMappingBone(PropertyGroup):
-    # URDF-Bone, auf den gemappt wird
     bvh_bone_name: StringProperty(name="URDF Bone")
-
-    # Welche BVH-Euler-Achse soll verwendet werden?
     source_axis: EnumProperty(
         name="BVH Axis",
         items=axis_items,
         default='X',
     )
-
-    # Vorzeichen
     sign: EnumProperty(
         name="Sign",
         items=sign_items,
@@ -246,7 +241,8 @@ class BVHMappingBone(PropertyGroup):
 class BVHMappingItem(PropertyGroup):
     urdf_bones: CollectionProperty(type=BVHMappingBone)
     bvh_bone_name: StringProperty(name="BVH Bone")
-    ref_rot: FloatVectorProperty(size=4)
+    # WICHTIG: Identitäts-Quaternion als Default, um Null-Quats zu vermeiden
+    ref_rot: FloatVectorProperty(size=4, default=(1.0, 0.0, 0.0, 0.0))
 
 class BVHMappingSettings(PropertyGroup):
     mappings: CollectionProperty(type=BVHMappingItem)
@@ -311,57 +307,59 @@ def restore_pose(pose_bones, stored):
         if pb.name in stored:
             pb.matrix_basis = stored[pb.name]
 
-def apply_t_pose(bvh_rig):
-    for pb in bvh_rig.pose.bones:
-        name = pb.name.lower()
+# ============================================================
+# T-POSE LOGIK
+# ============================================================
+def get_tpose_quaternion_for_bone(pb):
+    name = pb.name.lower()
+    e = mathutils.Euler((0.0, 0.0, 0.0), 'XYZ')
 
-        # Einheitliche Rotation
-        pb.rotation_mode = 'XYZ'
-        pb.rotation_euler = (0.0, 0.0, 0.0)
+    # --- ARMS ---
+    if any(k in name for k in ("upperarm", "humerus", "shoulder")):
+        if "left" in name or name.endswith(".l"):
+            e.z = math.radians(0)
+        elif "right" in name or name.endswith(".r"):
+            e.z = math.radians(0)
 
-        # --- ARMS ---
-        if any(k in name for k in ("upperarm", "humerus", "shoulder")):
-            # Arme horizontal ausrichten
-            if "left" in name or name.endswith(".l"):
-                pb.rotation_euler.z = math.radians(0)
-            elif "right" in name or name.endswith(".r"):
-                pb.rotation_euler.z = math.radians(0)
+    elif any(k in name for k in ("forearm", "lowerarm", "elbow")):
+        if "left" in name or name.endswith(".l"):
+            e.z = math.radians(0)
+        elif "right" in name or name.endswith(".r"):
+            e.z = math.radians(0)
 
-        elif any(k in name for k in ("forearm", "lowerarm", "elbow")):
-            # Unterarme folgen der Oberarmrotation
-            if "left" in name or name.endswith(".l"):
-                pb.rotation_euler.z = math.radians(0)
-            elif "right" in name or name.endswith(".r"):
-                pb.rotation_euler.z = math.radians(0)
+    elif any(k in name for k in ("hand", "wrist")):
+        if "left" in name or name.endswith(".l"):
+            e.z = math.radians(90)
+        elif "right" in name or name.endswith(".r"):
+            e.z = math.radians(-90)
 
-        elif any(k in name for k in ("hand", "wrist")):
-            # Hände ebenfalls horizontal
-            if "left" in name or name.endswith(".l"):
-                pb.rotation_euler.z = math.radians(90)
-            elif "right" in name or name.endswith(".r"):
-                pb.rotation_euler.z = math.radians(-90)
+    # --- LEGS ---
+    elif any(k in name for k in ("thigh", "upperleg", "upleg")):
+        e = mathutils.Euler((0.0, 0.0, 0.0), 'XYZ')
 
-        # --- LEGS ---
-        elif any(k in name for k in ("thigh", "upperleg", "upleg")):
-            pb.rotation_euler = (0.0, 0.0, 0.0)
+    elif any(k in name for k in ("calf", "lowerleg", "shin")):
+        e = mathutils.Euler((0.0, 0.0, 0.0), 'XYZ')
 
-        elif any(k in name for k in ("calf", "lowerleg", "shin")):
-            pb.rotation_euler = (0.0, 0.0, 0.0)
+    elif "foot" in name or "toe" in name:
+        e = mathutils.Euler((0.0, 0.0, 0.0), 'XYZ')
 
-        elif "foot" in name or "toe" in name:
-            pb.rotation_euler = (0.0, 0.0, 0.0)
+    return e.to_quaternion()
 
 def capture_reference_offsets(scene):
+    """Speichert pro BVH-Bone die virtuelle T-Pose-Quaternion als Referenz."""
     settings = scene.bvh_mapping_settings
     bvh_rig = scene.bvh_rig_object
+
+    if not bvh_rig:
+        return
 
     for item in settings.mappings:
         bvh_b = bvh_rig.pose.bones.get(item.bvh_bone_name)
         if not bvh_b:
             continue
 
-        q = bvh_b.matrix_basis.to_quaternion()
-        item.ref_rot = (q.w, q.x, q.y, q.z)
+        q_tpose = get_tpose_quaternion_for_bone(bvh_b)
+        item.ref_rot = (q_tpose.w, q_tpose.x, q_tpose.y, q_tpose.z)
 
 class OT_ApplyBVHMapping(bpy.types.Operator):
     bl_idname = "object.apply_bvh_mapping"
@@ -374,22 +372,14 @@ class OT_ApplyBVHMapping(bpy.types.Operator):
         bvh_rig = scene.bvh_rig_object
 
         current_frame = scene.frame_current
-        scene.frame_set(0)
+        scene.frame_set(current_frame)
 
         if not urdf_rig or not bvh_rig:
             self.report({'ERROR'}, "URDF or BVH rig missing")
             return {'CANCELLED'}
 
-        # --- AUTO T-POSE + OFFSET CAPTURE ---
-        stored_pose = store_pose(bvh_rig.pose.bones)
-        apply_t_pose(bvh_rig)
+        # Nur virtuelle T-Pose-Referenz berechnen, BVH-Rig bleibt unverändert
         capture_reference_offsets(scene)
-        restore_pose(bvh_rig.pose.bones, stored_pose)
-        scene.frame_set(current_frame)
-
-        if not urdf_rig:
-            self.report({'ERROR'}, "No URDF rig selected")
-            return {'CANCELLED'}
 
         # 1) Alle alten Constraints entfernen
         for pb in urdf_rig.pose.bones:
@@ -459,8 +449,8 @@ class OT_ResetBVHMapping(Operator):
     
 class OT_DebugTPose(Operator):
     bl_idname = "object.debug_bvh_tpose"
-    bl_label = "Show BVH T-Pose"
-    bl_description = "Temporarily pose the BVH rig into a T-pose for debugging"
+    bl_label = "Toggle BVH T-Pose Preview"
+    bl_description = "Show or hide a temporary T-pose preview without modifying the real BVH animation"
 
     def execute(self, context):
         scene = context.scene
@@ -470,9 +460,66 @@ class OT_DebugTPose(Operator):
             self.report({'ERROR'}, "No BVH rig selected")
             return {'CANCELLED'}
 
-        apply_t_pose(bvh_rig)
+        preview_name = bvh_rig.name + "_TPOSE_PREVIEW"
+        existing = bpy.data.objects.get(preview_name)
 
-        self.report({'INFO'}, "BVH rig posed into T-pose (not captured)")
+        # ----------------------------------------------------
+        # CASE 1: Preview exists → remove it + unhide original
+        # ----------------------------------------------------
+        if existing:
+            bpy.data.objects.remove(existing, do_unlink=True)
+
+            bvh_rig.hide_set(False)
+            bvh_rig.hide_viewport = False
+            bvh_rig.hide_render = False
+
+            context.view_layer.update()
+
+            self.report({'INFO'}, "T-pose preview removed")
+            return {'FINISHED'}
+
+        # ----------------------------------------------------
+        # CASE 2: Preview does not exist → create it
+        # ----------------------------------------------------
+
+        # 1) Duplikat erzeugen
+        collection = bvh_rig.users_collection[0] if bvh_rig.users_collection else context.scene.collection
+
+        tpose_rig = bvh_rig.copy()
+        tpose_rig.data = bvh_rig.data.copy()
+        tpose_rig.animation_data_clear()
+        tpose_rig.name = preview_name
+        collection.objects.link(tpose_rig)
+
+        # 2) Preview aktiv machen (entscheidend!)
+        bpy.ops.object.select_all(action='DESELECT')
+        tpose_rig.select_set(True)
+        context.view_layer.objects.active = tpose_rig
+
+        # 3) View-Layer refresh (Pose-Bones initialisieren)
+        context.view_layer.update()
+
+        # 4) Original ausblenden (erst jetzt!)
+        bvh_rig.hide_set(True)
+        bvh_rig.hide_viewport = True
+        bvh_rig.hide_render = True
+
+        # Preview-Rig global um 180° drehen (Z-Achse)
+        tpose_rig.rotation_euler.z += math.radians(180)
+
+        # 5) T-Pose anwenden
+        for pb in tpose_rig.pose.bones:
+            q = get_tpose_quaternion_for_bone(pb)
+            pb.rotation_mode = 'XYZ'
+            pb.rotation_euler = q.to_euler('XYZ')
+
+        # 6) Pose-Modus erzwingen
+        tpose_rig.data.pose_position = 'POSE'
+
+        # 7) Finaler Refresh
+        context.view_layer.update()
+
+        self.report({'INFO'}, "T-pose preview created")
         return {'FINISHED'}
 
 # ============================================================
@@ -500,9 +547,16 @@ class PANEL_BVHMapping(Panel):
 
         layout.operator("object.apply_bvh_mapping", text="Apply Mapping")
 
+        if scene.bvh_rig_object:
+            preview_name = scene.bvh_rig_object.name + "_TPOSE_PREVIEW"
+            exists = bpy.data.objects.get(preview_name) is not None
+            label = "Hide BVH T-Pose" if exists else "Show BVH T-Pose"
+        else:
+            label = "Show BVH T-Pose"
+
         layout.operator(
             "object.debug_bvh_tpose",
-            text="Show BVH T-Pose",
+            text=label,
             icon="ARMATURE_DATA"
         )
 
@@ -582,6 +636,9 @@ def retarget_frame(scene):
             continue
 
         ref_q = mathutils.Quaternion(item.ref_rot)
+        if ref_q == mathutils.Quaternion((0,0,0,0)):
+            continue
+
         cur_q = bvh_b.matrix_basis.to_quaternion()
         rot_bvh = ref_q.inverted() @ cur_q
         e_bvh = rot_bvh.to_euler('XYZ')
@@ -609,7 +666,6 @@ def retarget_frame(scene):
                 urdf_b[key] = value
             value -= urdf_b[key]
 
-            # Zielachse im URDF: immer Y
             urdf_b.rotation_euler = (0.0, value, 0.0)
 
 # ============================================================
