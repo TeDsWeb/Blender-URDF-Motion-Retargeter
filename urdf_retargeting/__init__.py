@@ -263,7 +263,13 @@ class BVHMappingSettings(PropertyGroup):
     active_mapping_index: IntProperty()
     active_urdf_index: IntProperty()
     live_retarget: BoolProperty(name="Live Retargeting")
-    smoothing: FloatProperty(name="Smoothing", default=0.75, min=0, max=1)
+    joint_smoothing: FloatProperty(
+        name="Joint Smoothing",
+        description="Low-pass filter on joint angles (actuator space)",
+        default=0.75,
+        min=0.0,
+        max=1.0,
+    )
     root_scale: FloatProperty(name="Root Scale", default=1.0)
     location_offset: FloatVectorProperty(name="Loc Offset", subtype="TRANSLATION")
     rotation_offset: FloatVectorProperty(name="Rot Offset", subtype="EULER")
@@ -332,8 +338,9 @@ def retarget_frame(scene):
             urdf_b["_joint_angle"] = final_angle
             target_q = mathutils.Euler((0, final_angle, 0)).to_quaternion()
             urdf_b.rotation_mode = "QUATERNION"
+            # URDF joint smoothing
             urdf_b.rotation_quaternion = urdf_b.rotation_quaternion.slerp(
-                target_q, 1 - settings.smoothing
+                target_q, 1 - settings.joint_smoothing
             )
 
 
@@ -449,6 +456,9 @@ class OT_ExportBeyondMimic(Operator):
                         "export_hz": target_hz,
                         "duration_secs": duration,
                         "total_samples": len(data_rows),
+                        # Export Settings
+                        "bvh_prefilter": settings.bvh_prefilter,
+                        "joint_smoothing": settings.joint_smoothing,
                         # Units
                         "measurement_unit": "meters",
                         "angle_unit": "radians",
@@ -506,7 +516,14 @@ class UL_BVHMappingList(UIList):
     def draw_item(
         self, context, layout, data, item, icon, active_data, active_propname, index
     ):
-        layout.label(text=item.bvh_bone_name)
+        row = layout.row(align=True)
+        row.label(text=f"BVH: {item.bvh_bone_name}")
+        count = len(item.urdf_bones)
+        if count > 0:
+            row.label(text=f"URDF: {count}")
+        else:
+            row.enabled = False
+            row.label(text=f"URDF: {count}")
 
 
 class UL_URDFBoneList(UIList):
@@ -547,11 +564,16 @@ class PANEL_BVHMapping(Panel):
         box.prop(settings, "transfer_root_rot")
         box.prop(settings, "location_offset")
         box.prop(settings, "rotation_offset")
-        box.prop(settings, "smoothing")
+        box.prop(settings, "joint_smoothing")
 
         layout.prop(settings, "live_retarget", toggle=True)
         layout.operator("object.generate_mapping_list")
-        if settings.mappings:
+        if not settings.mappings:
+            layout.label(
+                text="Click 'Generate Mapping List' to show bones.", icon="INFO"
+            )
+            return
+        else:
             layout.template_list(
                 "UL_BVHMappingList",
                 "",
@@ -597,27 +619,40 @@ class PANEL_BVHMapping(Panel):
 class OT_GenerateMappingList(Operator):
     bl_idname = "object.generate_mapping_list"
     bl_label = "Generate Mapping List"
+    bl_description = "Generates BVH bone list from selected BVH rig"
 
     def execute(self, context):
-        bvh = context.scene.bvh_rig_object
-        if bvh:
-            context.scene.bvh_mapping_settings.mappings.clear()
-            for pb in bvh.pose.bones:
-                context.scene.bvh_mapping_settings.mappings.add().bvh_bone_name = (
-                    pb.name
-                )
+        scene = context.scene
+        settings = scene.bvh_mapping_settings
+        bvh_rig = scene.bvh_rig_object
+        if not bvh_rig:
+            return {"CANCELLED"}
+
+        settings.mappings.clear()
+        for ub in [pb.name for pb in bvh_rig.pose.bones]:
+            item = settings.mappings.add()
+            item.bvh_bone_name = ub
+
+        settings.active_mapping_index = 0
+        settings.active_urdf_index = 0
         return {"FINISHED"}
 
 
 class OT_ApplyBVHMapping(Operator):
     bl_idname = "object.apply_bvh_mapping"
     bl_label = "Apply Mapping"
+    bl_description = "Applies the current BVH → URDF mapping once"
 
     def execute(self, context):
         if context.scene.urdf_rig_object:
             for pb in context.scene.urdf_rig_object.pose.bones:
-                if "offset" in pb:
-                    del pb["offset"]
+                for key in ("offset", "_joint_angle"):
+                    pb.pop(key, None)
+
+        for key in ("_prev_euler_cache", "_bvh_prefilter_cache"):
+            if key in context.scene:
+                context.scene.pop(key, None)
+
         context.scene.bvh_mapping_settings.live_retarget = True
         return {"FINISHED"}
 
@@ -625,6 +660,7 @@ class OT_ApplyBVHMapping(Operator):
 class OT_AddBVHBone(Operator):
     bl_idname = "object.add_urdf_bone"
     bl_label = "Add"
+    bl_description = "Add URDF Bone to Mapping"
     bvh_bone_name: StringProperty()
 
     def execute(self, context):
@@ -640,6 +676,7 @@ class OT_AddBVHBone(Operator):
 class OT_RemoveBVHBone(Operator):
     bl_idname = "object.remove_urdf_bone"
     bl_label = "Rem"
+    bl_description = "Remove URDF Bone from Mapping"
     bvh_bone_name: StringProperty()
 
     def execute(self, context):
@@ -655,6 +692,9 @@ class OT_RemoveBVHBone(Operator):
 class IMPORT_OT_urdf_humanoid(Operator, ImportHelper):
     bl_idname = "import_scene.urdf_humanoid"
     bl_label = "Import URDF"
+    bl_description = (
+        "Imports a URDF humanoid robot and creates an armature with bound meshes."
+    )
     filename_ext = ".urdf"
 
     def execute(self, context):
