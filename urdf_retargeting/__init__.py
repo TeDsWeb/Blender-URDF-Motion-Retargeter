@@ -328,6 +328,8 @@ def retarget_frame(scene):
                 "limit_upper", 3.14
             )
             final_angle = max(min(final_angle, l_max), l_min)
+            # Store joint angle explicitly for export (avoid Euler later)
+            urdf_b["_joint_angle"] = final_angle
             target_q = mathutils.Euler((0, final_angle, 0)).to_quaternion()
             urdf_b.rotation_mode = "QUATERNION"
             urdf_b.rotation_quaternion = urdf_b.rotation_quaternion.slerp(
@@ -374,7 +376,7 @@ class OT_ExportBeyondMimic(Operator):
         num_steps = int(duration * target_hz) + 1
         time_per_step = 1.0 / target_hz
 
-        joints = [pb.name for pb in urdf.pose.bones]
+        joints = list(urdf.get("urdf_joint_order", []))
         header = [
             "root_tx",
             "root_ty",
@@ -417,7 +419,7 @@ class OT_ExportBeyondMimic(Operator):
             # Collect Joint Data
             for j in joints:
                 pb = urdf.pose.bones[j]
-                row.append(pb.rotation_quaternion.to_euler("XYZ").y)
+                row.append(pb.get("_joint_angle", 0.0))
 
                 # Metadata (limits) only needed once
                 if step == 0:
@@ -438,11 +440,22 @@ class OT_ExportBeyondMimic(Operator):
             with open(json_path, "w") as f:
                 json.dump(
                     {
+                        "source_bvh": base_name,
+                        "target_urdf": bpy.path.clean_name(urdf.name),
                         "source_fps": fps,
+                        "source_total_frames": total_frames,
                         "export_hz": target_hz,
                         "duration_secs": duration,
                         "total_samples": len(data_rows),
+                        "messure_unit": "meters",
+                        # Root definition (LAFAN1 / Beyond Mimic style)
+                        "root_dofs": ["x", "y", "z", "qx", "qy", "qz", "qw"],
+                        "root_frame": "world",
+                        "up_axis": "Z",
+                        "forward_axis": "X",
+                        # Joint definition
                         "joints": joints,
+                        "joint_type": "hinge",
                         "limits": meta_joints,
                     },
                     f,
@@ -631,6 +644,7 @@ class IMPORT_OT_urdf_humanoid(Operator, ImportHelper):
         arm, link_mats = create_urdf_armature(robot)
         bind_meshes(robot, arm, link_mats, os.path.dirname(self.filepath))
         context.scene.urdf_rig_object = arm
+        arm["urdf_joint_order"] = [j.child for j in robot.joints.values()]
         return {"FINISHED"}
 
 
