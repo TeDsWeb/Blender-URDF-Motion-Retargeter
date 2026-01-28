@@ -263,7 +263,7 @@ class BVHMappingSettings(PropertyGroup):
     active_mapping_index: IntProperty()
     active_urdf_index: IntProperty()
     live_retarget: BoolProperty(name="Live Retargeting")
-    smoothing: FloatProperty(name="Smoothing", default=0.25, min=0, max=1)
+    smoothing: FloatProperty(name="Smoothing", default=0.75, min=0, max=1)
     root_scale: FloatProperty(name="Root Scale", default=1.0)
     location_offset: FloatVectorProperty(name="Loc Offset", subtype="TRANSLATION")
     rotation_offset: FloatVectorProperty(name="Rot Offset", subtype="EULER")
@@ -333,7 +333,7 @@ def retarget_frame(scene):
             target_q = mathutils.Euler((0, final_angle, 0)).to_quaternion()
             urdf_b.rotation_mode = "QUATERNION"
             urdf_b.rotation_quaternion = urdf_b.rotation_quaternion.slerp(
-                target_q, settings.smoothing
+                target_q, 1 - settings.smoothing
             )
 
 
@@ -440,23 +440,41 @@ class OT_ExportBeyondMimic(Operator):
             with open(json_path, "w") as f:
                 json.dump(
                     {
+                        # Origin Info
                         "source_bvh": base_name,
                         "target_urdf": bpy.path.clean_name(urdf.name),
+                        # Timing
                         "source_fps": fps,
                         "source_total_frames": total_frames,
                         "export_hz": target_hz,
                         "duration_secs": duration,
                         "total_samples": len(data_rows),
-                        "messure_unit": "meters",
-                        # Root definition (LAFAN1 / Beyond Mimic style)
-                        "root_dofs": ["x", "y", "z", "qx", "qy", "qz", "qw"],
-                        "root_frame": "world",
-                        "up_axis": "Z",
-                        "forward_axis": "X",
+                        # Units
+                        "measurement_unit": "meters",
+                        "angle_unit": "radians",
+                        # Root / Base definition
+                        "root": {
+                            "type": "free_floating_base",
+                            "frame": "blender_world",
+                            "dofs": ["x", "y", "z", "qx", "qy", "qz", "qw"],
+                            "representation": "quaternion",
+                            "note": "No semantic root bone; base pose is encoded as world-space transform of the URDF armature object",
+                        },
+                        # Coordinate system (explicit but honest)
+                        "coordinate_system": {
+                            "space": "blender_world",
+                            "up_axis": "Z",
+                            "forward_axis": None,
+                            "right_axis": "X",
+                            "note": "URDF does not define a semantic forward axis; heading is encoded in the root orientation quaternion",
+                        },
                         # Joint definition
-                        "joints": joints,
-                        "joint_type": "hinge",
-                        "limits": meta_joints,
+                        "joints": {
+                            "order": joints,
+                            "type": "hinge",
+                            "angle_unit": "radians",
+                            "limits": meta_joints,
+                        },
                     },
                     f,
                     indent=4,
