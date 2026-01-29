@@ -263,10 +263,17 @@ class BVHMappingSettings(PropertyGroup):
     active_mapping_index: IntProperty()
     active_urdf_index: IntProperty()
     live_retarget: BoolProperty(name="Live Retargeting")
+    bvh_smoothing: FloatProperty(
+        name="BVH Smoothing",
+        description="Low-pass filter on BVH joint angles (source space)",
+        default=0.9,
+        min=0.0,
+        max=1.0,
+    )
     joint_smoothing: FloatProperty(
         name="Joint Smoothing",
         description="Low-pass filter on joint angles (actuator space)",
-        default=0.75,
+        default=0.9,
         min=0.0,
         max=1.0,
     )
@@ -285,63 +292,173 @@ class BVHMappingSettings(PropertyGroup):
 
 @persistent
 def retarget_frame(scene):
+    """
+    Handler function executed on every frame change to synchronize
+    the URDF robot rig with the BVH motion capture data.
+    """
     settings = scene.bvh_mapping_settings
     if not settings.live_retarget:
         return
+
     urdf, bvh = scene.urdf_rig_object, scene.bvh_rig_object
     if not urdf or not bvh:
         return
 
+    # Initialize a persistent dictionary in the Blender scene to store
+    # rotation data across frames. This is essential for smoothing and
+    # preventing sudden 180-degree flips.
+    if "_bvh_smooth_cache" not in scene:
+        scene["_bvh_smooth_cache"] = {}
+
+    smooth_cache = scene["_bvh_smooth_cache"]
+
+    # --- 1. ROOT POSITION & ROTATION SMOOTHING ---
+    # The 'Root' defines the global position/orientation of the robot.
     if bvh.pose.bones:
-        bvh_root = bvh.matrix_world @ bvh.pose.bones[0].matrix
-        urdf.location = (
-            bvh_root.to_translation() * settings.root_scale
+        # Get the global world matrix of the first BVH bone (usually the Pelvis/Hips)
+        bvh_root_mat = bvh.matrix_world @ bvh.pose.bones[0].matrix
+
+        # Calculate the intended target position, applying scale and user-defined offsets
+        target_loc = (
+            bvh_root_mat.to_translation() * settings.root_scale
         ) + mathutils.Vector(settings.location_offset)
+
+        # Combine BVH root rotation with a user-defined rotation offset (T-Pose alignment)
+        off_q = mathutils.Euler(settings.rotation_offset).to_quaternion()
+        target_rot = bvh_root_mat.to_quaternion() @ off_q
+
+        # Apply temporal smoothing to the root to prevent the robot from "shaking"
+        if "root_loc_prev" in smooth_cache:
+            # Alpha: 1.0 means instant movement, near 0.0 means heavy lag/smoothing
+            alpha = 1.0 - settings.bvh_smoothing
+
+            # Linear Interpolation (Lerp) for the X, Y, Z coordinates
+            prev_loc = mathutils.Vector(smooth_cache["root_loc_prev"])
+            urdf.location = prev_loc.lerp(target_loc, alpha)
+
+            # Spherical Linear Interpolation (Slerp) for the rotation
+            if settings.transfer_root_rot:
+                prev_rot = mathutils.Quaternion(smooth_cache["root_rot_prev"])
+
+                # Check dot product to ensure Slerp takes the shortest path between orientations
+                if prev_rot.dot(target_rot) < 0:
+                    target_rot.negate()
+
+                urdf.rotation_mode = "QUATERNION"
+                urdf.rotation_quaternion = prev_rot.slerp(target_rot, alpha)
+        else:
+            # First frame initialization: set position/rotation instantly without smoothing
+            urdf.location = target_loc
+            if settings.transfer_root_rot:
+                urdf.rotation_mode = "QUATERNION"
+                urdf.rotation_quaternion = target_rot
+
+        # Store results in cache for the next frame calculation
+        smooth_cache["root_loc_prev"] = urdf.location.copy()
         if settings.transfer_root_rot:
-            off_q = mathutils.Euler(settings.rotation_offset).to_quaternion()
-            urdf.rotation_mode, urdf.rotation_quaternion = (
-                "QUATERNION",
-                bvh_root.to_quaternion() @ off_q,
-            )
+            smooth_cache["root_rot_prev"] = urdf.rotation_quaternion.copy()
 
-    if "_prev_euler_cache" not in scene:
-        scene["_prev_euler_cache"] = {}
-    cache = scene["_prev_euler_cache"]
-
+    # --- 2. JOINT RETARGETING LOOP ---
+    # Iterate through all bone mappings defined in the UI list
     for item in settings.mappings:
         bvh_b = bvh.pose.bones.get(item.bvh_bone_name)
         if not bvh_b:
             continue
-        ref_q = mathutils.Quaternion(item.ref_rot)
-        rot_rel = ref_q.inverted() @ bvh_b.matrix_basis.to_quaternion()
-        e = rot_rel.to_euler("XYZ")
-        key = f"{bvh.name}:{bvh_b.name}"
-        if key in cache:
-            e.make_compatible(cache[key])
-        cache[key] = e.copy()
 
+        # INPUT SMOOTHING:
+        # Smooth the raw incoming BVH bone rotation before extracting specific angles.
+        current_q = bvh_b.matrix_basis.to_quaternion()
+        cache_key = f"{bvh.name}:{bvh_b.name}"
+
+        if cache_key in smooth_cache:
+            prev_q = mathutils.Quaternion(smooth_cache[cache_key])
+            if prev_q.dot(current_q) < 0:
+                current_q.negate()
+            # Apply Slerp based on the user-defined BVH smoothing factor
+            current_q = prev_q.slerp(current_q, 1.0 - settings.bvh_smoothing)
+
+        # Save smoothed quaternion back to cache
+        smooth_cache[cache_key] = current_q.copy()
+
+        # REFERENCE TRANSFORMATION:
+        # Calculate the rotation 'delta' relative to the saved reference pose (T-Pose).
+        # This isolates the actual movement performed during the animation.
+        ref_q = mathutils.Quaternion(item.ref_rot)
+        delta_q = ref_q.inverted() @ current_q
+
+        # --- 3. TRANSFORMATION & EXTRAKTION ---
+        # A single BVH bone might drive multiple URDF joints (e.g., Shoulder X and Y)
         for b in item.urdf_bones:
             urdf_b = urdf.pose.bones.get(b.bvh_bone_name)
             if not urdf_b:
                 continue
-            val = getattr(e, b.source_axis.lower())
+
+            # ROTATION PROJECTION:
+            # To avoid "cross-talk" between axes (e.g., arm swing affecting arm roll),
+            # we project the full 3D rotation onto the specific mechanical axis (X, Y, or Z).
+            axis_vec, angle = delta_q.to_axis_angle()
+
+            # Define the target vector based on the source axis selected in the UI
+            target_axis_vec = mathutils.Vector((0, 0, 0))
+            if b.source_axis == "X":
+                target_axis_vec = mathutils.Vector((1, 0, 0))
+            elif b.source_axis == "Y":
+                target_axis_vec = mathutils.Vector((0, 1, 0))
+            else:
+                target_axis_vec = mathutils.Vector((0, 0, 1))
+
+            # Use the dot product to find how much of the rotation happened around our axis
+            val = angle * axis_vec.dot(target_axis_vec)
+
+            # CONTINUITY CHECK (Anti-Flip):
+            # Rotations often jump from +180 to -180 degrees (Pi to -Pi).
+            # We track the value over time and add/subtract 2*Pi to keep the motion continuous.
+            cache_val_key = f"val_{cache_key}_{b.bvh_bone_name}"
+            if cache_val_key in smooth_cache:
+                prev_val = smooth_cache[cache_val_key]
+                diff = val - prev_val
+                if diff > math.pi:
+                    val -= 2 * math.pi
+                elif diff < -math.pi:
+                    val += 2 * math.pi
+            smooth_cache[cache_val_key] = val
+
+            # Adjust sign and apply the zero-offset (calibration offset)
             if b.sign == "NEG":
                 val = -val
             if "offset" not in urdf_b:
                 urdf_b["offset"] = val
-            final_angle = val - urdf_b["offset"] + b.neutral_offset
-            l_min, l_max = urdf_b.get("limit_lower", -3.14), urdf_b.get(
-                "limit_upper", 3.14
+
+            # Combine the relative movement with the robot's mechanical neutral position
+            target_angle = val - urdf_b["offset"] + b.neutral_offset
+
+            # OUTPUT SMOOTHING (Exponential Moving Average):
+            # Final filter to simulate motor inertia and create clean training data.
+            if "_last_urdf_angle" not in urdf_b:
+                urdf_b["_last_urdf_angle"] = target_angle
+
+            # Alpha determines the "stiffness" of the joint.
+            # (1.0 = direct response, 0.1 = very soft/delayed)
+            alpha_joint = 1.0 - settings.joint_smoothing
+            final_angle = (alpha_joint * target_angle) + (
+                (1.0 - alpha_joint) * urdf_b["_last_urdf_angle"]
             )
+            urdf_b["_last_urdf_angle"] = final_angle
+
+            # JOINT LIMITS:
+            # Ensure the angle does not exceed the mechanical limits defined in the URDF.
+            l_min = urdf_b.get("limit_lower", -3.14)
+            l_max = urdf_b.get("limit_upper", 3.14)
             final_angle = max(min(final_angle, l_max), l_min)
-            # Store joint angle explicitly for export (avoid Euler later)
+
+            # Store the computed angle for external export scripts
             urdf_b["_joint_angle"] = final_angle
-            target_q = mathutils.Euler((0, final_angle, 0)).to_quaternion()
+
+            # APPLICATION:
+            # Apply the rotation to the Blender Bone.
+            # Note: We use a local Y-axis rotation as the standard for robot joints.
             urdf_b.rotation_mode = "QUATERNION"
-            # URDF joint smoothing
-            urdf_b.rotation_quaternion = urdf_b.rotation_quaternion.slerp(
-                target_q, 1 - settings.joint_smoothing
-            )
+            urdf_b.rotation_quaternion = mathutils.Quaternion((0, 1, 0), final_angle)
 
 
 # ============================================================
@@ -457,7 +574,7 @@ class OT_ExportBeyondMimic(Operator):
                         "duration_secs": duration,
                         "total_samples": len(data_rows),
                         # Export Settings
-                        "bvh_prefilter": settings.bvh_prefilter,
+                        "bvh_smoothing": settings.bvh_smoothing,
                         "joint_smoothing": settings.joint_smoothing,
                         # Units
                         "measurement_unit": "meters",
@@ -564,6 +681,7 @@ class PANEL_BVHMapping(Panel):
         box.prop(settings, "transfer_root_rot")
         box.prop(settings, "location_offset")
         box.prop(settings, "rotation_offset")
+        box.prop(settings, "bvh_smoothing")
         box.prop(settings, "joint_smoothing")
 
         layout.prop(settings, "live_retarget", toggle=True)
@@ -646,10 +764,10 @@ class OT_ApplyBVHMapping(Operator):
     def execute(self, context):
         if context.scene.urdf_rig_object:
             for pb in context.scene.urdf_rig_object.pose.bones:
-                for key in ("offset", "_joint_angle"):
+                for key in ("offset", "_joint_angle", "_last_urdf_angle"):
                     pb.pop(key, None)
 
-        for key in ("_prev_euler_cache", "_bvh_prefilter_cache"):
+        for key in "_bvh_smooth_cache":
             if key in context.scene:
                 context.scene.pop(key, None)
 
