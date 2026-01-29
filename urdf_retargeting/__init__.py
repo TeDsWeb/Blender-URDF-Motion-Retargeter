@@ -119,7 +119,10 @@ def parse_urdf(path):
         robot.links[link.name] = link
 
     for idx, joint_el in enumerate(root.findall("joint")):
-        name = joint_el.attrib.get("name", "joint_%03d" % idx)
+        # Use the actual 'name' attribute from the URDF joint element
+        name = joint_el.attrib.get("name")
+        if not name:
+            name = f"joint_{idx:03d}"  # Fallback only if attribute is missing
         jtype = joint_el.attrib.get("type", "fixed")
         parent = joint_el.find("parent").attrib["link"]
         child = joint_el.find("child").attrib["link"]
@@ -180,43 +183,81 @@ def build_link_transforms(robot):
 
 
 def create_urdf_armature(robot):
-    """Creates a Blender armature based on URDF joint structure."""
-    link_mats, root = build_link_transforms(robot)
+    """Creates armature with bones named after URDF JOINTS."""
+    link_mats, root_link_name = build_link_transforms(robot)
+
+    # Create the armature object
     bpy.ops.object.add(type="ARMATURE", enter_editmode=True)
     arm_obj = bpy.context.object
     arm_obj.name = f"{robot.name}_Rig"
     bones = arm_obj.data.edit_bones
-    link_to_bone = {link_name: bones.new(link_name) for link_name in link_mats}
+
+    # Link Name -> Bone Name (Joint Name) mapping
+    # Required because meshes belong to links, but bones are now joints
+    link_to_bone_name = {root_link_name: root_link_name}
+    bones.new(root_link_name)  # Root bone for the base
+
+    # Create bones for each joint
+    for j_name, j in robot.joints.items():
+        bones.new(j_name)
+        link_to_bone_name[j.child] = j_name
+
     for j in robot.joints.values():
-        b = link_to_bone.get(j.child)
+        b = bones.get(j.name)
         if b:
+            # Set bone position based on the child link's world transform
             head = link_mats[j.child].to_translation()
             joint_rot = mathutils.Euler(j.rpy, "XYZ").to_matrix()
             axis_world = (
                 link_mats[j.parent].to_3x3() @ joint_rot @ mathutils.Vector(j.axis)
             ).normalized()
+
             b.head, b.tail = head, head + axis_world * 0.05
-            if j.parent in link_to_bone:
-                b.parent = link_to_bone[j.parent]
+
+            # Parent to the bone that controls the parent link
+            p_bone_name = link_to_bone_name.get(j.parent)
+            if p_bone_name:
+                b.parent = bones.get(p_bone_name)
+
     bpy.ops.object.mode_set(mode="OBJECT")
+
+    # Store the mapping inside the object for the bind_meshes function
+    arm_obj["_link_to_bone"] = link_to_bone_name
+
+    # Store limits in bone custom properties for retargeting
     for j_name, j in robot.joints.items():
-        if j.child in arm_obj.pose.bones:
-            pb = arm_obj.pose.bones[j.child]
+        if j_name in arm_obj.pose.bones:
+            pb = arm_obj.pose.bones[j_name]
             if j.limit_lower is not None:
                 pb["limit_lower"] = j.limit_lower
+            else:
+                pb["limit_lower"] = -3.14159  # Fallback
+
             if j.limit_upper is not None:
                 pb["limit_upper"] = j.limit_upper
+            else:
+                pb["limit_upper"] = 3.14159  # Fallback
+
     return arm_obj, link_mats
 
 
 def bind_meshes(robot, arm_obj, link_mats, base_path):
-    """Imports meshes and parents them to bones with correct offsets."""
+    """Imports meshes and parents them to bones (named after joints)."""
+    # Retrieve the mapping from the armature object
+    link_to_bone_name = arm_obj.get("_link_to_bone", {})
+
     for link_name, link in robot.links.items():
+        bone_name = link_to_bone_name.get(link_name)
+
         for idx, vis in enumerate(link.visuals):
             mesh_raw = vis.mesh.replace("package://", "")
             mesh_path = os.path.normpath(os.path.join(base_path, mesh_raw))
             if not os.path.exists(mesh_path):
                 continue
+
+            # CRITICAL: Deselect to ensure the imported object is the only selection
+            bpy.ops.object.select_all(action="DESELECT")
+
             ext = os.path.splitext(mesh_path)[1].lower()
             if ext == ".stl":
                 bpy.ops.wm.stl_import(filepath=mesh_path)
@@ -224,18 +265,28 @@ def bind_meshes(robot, arm_obj, link_mats, base_path):
                 bpy.ops.wm.obj_import(filepath=mesh_path)
             elif ext == ".dae":
                 bpy.ops.wm.collada_import(filepath=mesh_path)
+
             if bpy.context.selected_objects:
                 obj = bpy.context.selected_objects[0]
+
+                # Safety check: avoid parenting the armature to itself
+                if obj == arm_obj:
+                    continue
+
                 obj.name = f"{link_name}_mesh_{idx}"
-                target_mtx = link_mats[link_name] @ origin_to_matrix(vis.xyz, vis.rpy)
                 obj.parent = arm_obj
-                if link_name in arm_obj.pose.bones:
-                    obj.parent_type, obj.parent_bone = "BONE", link_name
+
+                # Parent to bone using the Joint Name from our map
+                if bone_name and bone_name in arm_obj.pose.bones:
+                    obj.parent_type, obj.parent_bone = "BONE", bone_name
                     bone_mtx_world = (
-                        arm_obj.matrix_world @ arm_obj.pose.bones[link_name].matrix
+                        arm_obj.matrix_world @ arm_obj.pose.bones[bone_name].matrix
                     )
                     obj.matrix_parent_inverse = bone_mtx_world.inverted()
-                obj.matrix_world = target_mtx
+
+                obj.matrix_world = link_mats[link_name] @ origin_to_matrix(
+                    vis.xyz, vis.rpy
+                )
 
 
 # ============================================================
@@ -782,21 +833,48 @@ class OT_GenerateMappingList(Operator):
 
 
 class OT_ApplyBVHMapping(Operator):
+    """Resets the URDF rig to default pose, moves to frame 0, and initializes retargeting"""
+
     bl_idname = "object.apply_bvh_mapping"
     bl_label = "Apply Mapping"
-    bl_description = "Applies the current BVH → URDF mapping once"
+    bl_description = "Resets rig to neutral pose at frame 0 and starts live retargeting"
 
     def execute(self, context):
-        if context.scene.urdf_rig_object:
-            for pb in context.scene.urdf_rig_object.pose.bones:
+        scene = context.scene
+        urdf_obj = scene.urdf_rig_object
+
+        # 1. Reset timeline to start
+        scene.frame_set(0)
+
+        if urdf_obj:
+            # 2. Reset all pose bones to neutral URDF orientation
+            for pb in urdf_obj.pose.bones:
+                # Reset rotation and respect joint limits (assuming Quaternion mode as used in retarget_frame)
+                pb.rotation_mode = "QUATERNION"
+
+                l_min = pb.get("limit_lower", -3.14)
+                l_max = pb.get("limit_upper", 3.14)
+                neutral = max(min(0.0, l_max), l_min)
+
+                pb.rotation_quaternion = mathutils.Quaternion((0, 1, 0), neutral)
+
+                # 3. Clear internal calculation caches for this bone
                 for key in ("offset", "_joint_angle", "_last_urdf_angle"):
-                    pb.pop(key, None)
+                    if key in pb:
+                        del pb[key]
 
-        for key in "_bvh_smooth_cache":
-            if key in context.scene:
-                context.scene.pop(key, None)
+        # 4. Clear global smoothing caches from the scene
+        if "_bvh_smooth_cache" in scene:
+            # We clear the dictionary content rather than popping the key
+            # to avoid iteration errors if the handler is currently running
+            scene["_bvh_smooth_cache"] = {}
 
-        context.scene.bvh_mapping_settings.live_retarget = True
+        # 5. Enable the retargeting handler
+        scene.bvh_mapping_settings.live_retarget = True
+        for _ in range(100):
+            scene.frame_set(0)
+
+        self.report({"INFO"}, "Rig reset to frame 0. Retargeting active.")
         return {"FINISHED"}
 
 
@@ -844,8 +922,16 @@ class IMPORT_OT_urdf_humanoid(Operator, ImportHelper):
         robot = parse_urdf(self.filepath)
         arm, link_mats = create_urdf_armature(robot)
         bind_meshes(robot, arm, link_mats, os.path.dirname(self.filepath))
+
         context.scene.urdf_rig_object = arm
-        arm["urdf_joint_order"] = [j.child for j in robot.joints.values()]
+
+        # We only want movable joints for the trajectory (Beyond Mimic requirement)
+        arm["urdf_joint_order"] = [
+            j.name
+            for j in robot.joints.values()
+            if j.type in {"revolute", "continuous", "prismatic"}
+        ]
+
         return {"FINISHED"}
 
 
