@@ -445,21 +445,22 @@ def retarget_frame(scene):
                 continue
 
             # ROTATION PROJECTION:
-            # To avoid "cross-talk" between axes (e.g., arm swing affecting arm roll),
-            # we project the full 3D rotation onto the specific mechanical axis (X, Y, or Z).
-            axis_vec, angle = delta_q.to_axis_angle()
-
-            # Define the target vector based on the source axis selected in the UI
-            target_axis_vec = mathutils.Vector((0, 0, 0))
+            # 1. Define the twist axis in BVH local space
             if b.source_axis == "X":
-                target_axis_vec = mathutils.Vector((1, 0, 0))
+                twist_axis = mathutils.Vector((1, 0, 0))
             elif b.source_axis == "Y":
-                target_axis_vec = mathutils.Vector((0, 1, 0))
+                twist_axis = mathutils.Vector((0, 1, 0))
             else:
-                target_axis_vec = mathutils.Vector((0, 0, 1))
+                twist_axis = mathutils.Vector((0, 0, 1))
 
-            # Use the dot product to find how much of the rotation happened around our axis
-            val = angle * axis_vec.dot(target_axis_vec)
+            # 2. Extract the component of rotation around the twist axis
+            # Project the quaternion vector part onto the twist axis
+            q_vec = mathutils.Vector((delta_q.x, delta_q.y, delta_q.z))
+            projection = q_vec.dot(twist_axis)
+
+            # 3. Calculate the angle around the twist axis
+            # Use the atan2 formulation for better numerical stability
+            val = 2.0 * math.atan2(projection, delta_q.w)
 
             # CONTINUITY CHECK (Anti-Flip):
             # Rotations often jump from +180 to -180 degrees (Pi to -Pi).
