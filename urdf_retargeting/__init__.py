@@ -525,9 +525,34 @@ class OT_ExportBeyondMimic(Operator):
             # Set frame and subframe (crucial for smooth interpolation)
             scene.frame_set(int(blender_frame), subframe=blender_frame % 1.0)
 
+            # --- Geometry-Based Grounding ---
             if settings.auto_grounding:
-                min_z = min((urdf.matrix_world @ pb.head).z for pb in urdf.pose.bones)
-                urdf.location.z -= min_z
+                # We find the absolute lowest Z coordinate across all mesh parts
+                global_min_z = float("inf")
+                found_mesh = False
+
+                # Iterate through all objects parented to the rig (links/visuals)
+                for child in urdf.children:
+                    if child.type == "MESH":
+                        found_mesh = True
+                        # The bound_box is in local space, we need to transform it to world space
+                        # mesh.bound_box contains 8 corners
+                        matrix_world = child.matrix_world
+                        for corner in child.bound_box:
+                            # Transform local corner to world space
+                            world_corner = matrix_world @ mathutils.Vector(corner)
+                            if world_corner.z < global_min_z:
+                                global_min_z = world_corner.z
+
+                # Fallback: If no meshes are found, use the bone heads as a safety measure
+                if not found_mesh:
+                    global_min_z = min(
+                        (urdf.matrix_world @ pb.head).z for pb in urdf.pose.bones
+                    )
+
+                # Subtract the lowest point from the root's Z position
+                # This snaps the "sole" of the robot's foot to exactly Z=0
+                urdf.location.z -= global_min_z
 
             # Collect Root Data
             row = [
