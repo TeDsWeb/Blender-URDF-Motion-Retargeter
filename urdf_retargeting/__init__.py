@@ -745,6 +745,24 @@ class PANEL_BVHMapping(Panel):
     bl_region_type = "UI"
     bl_category = "BVH → URDF Retargeting"
 
+    def check_duplicate_mappings(self, context):
+        settings = context.scene.bvh_mapping_settings
+        used_urdf_bones = {}
+        duplicates = []
+
+        for item in settings.mappings:
+            for u_bone in item.urdf_bones:
+                name = u_bone.bvh_bone_name  # URDF joint name
+                if name:
+                    if name in used_urdf_bones:
+                        used_urdf_bones[name].append(item.bvh_bone_name)
+                        if name not in duplicates:
+                            duplicates.append(name)
+                    else:
+                        used_urdf_bones[name] = [item.bvh_bone_name]
+
+        return duplicates, used_urdf_bones
+
     def draw(self, context):
         layout = self.layout
         s = context.scene
@@ -796,6 +814,16 @@ class PANEL_BVHMapping(Panel):
                 col.operator(
                     "object.remove_urdf_bone", text="", icon="REMOVE"
                 ).bvh_bone_name = active.bvh_bone_name
+        duplicates, _ = self.check_duplicate_mappings(context)
+        if duplicates:
+            box = layout.box()
+            box.alert = True  # Highlight box in red
+            col = box.column()
+            col.label(text="WARNING: Multiple assignments!", icon="ERROR")
+            for d in duplicates:
+                col.label(
+                    text=f"Joint '{d}' is controlled multiple times", icon="BONE_DATA"
+                )
         layout.operator("object.apply_bvh_mapping")
 
         layout.separator()
