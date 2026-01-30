@@ -60,6 +60,7 @@ class URDFJoint:
         axis,
         limit_lower=None,
         limit_upper=None,
+        velocity_limit=None,
     ):
         self.name = name
         self.type = jtype
@@ -70,6 +71,7 @@ class URDFJoint:
         self.axis = axis
         self.limit_lower = limit_lower
         self.limit_upper = limit_upper
+        self.velocity_limit = velocity_limit
 
 
 class URDFRobot:
@@ -144,8 +146,11 @@ def parse_urdf(path):
             if limit_el is not None
             else None
         )
+        velocity = (
+            float(limit_el.get("velocity", 10.0)) if limit_el is not None else 10.0
+        )
         robot.joints[name] = URDFJoint(
-            name, jtype, parent, child, xyz, rpy, axis, lower, upper
+            name, jtype, parent, child, xyz, rpy, axis, lower, upper, velocity
         )
     return robot
 
@@ -224,7 +229,7 @@ def create_urdf_armature(robot):
     # Store the mapping inside the object for the bind_meshes function
     arm_obj["_link_to_bone"] = link_to_bone_name
 
-    # Store limits in bone custom properties for retargeting
+    # Store joint type and limits in bone custom properties for retargeting
     for j_name, j in robot.joints.items():
         if j_name in arm_obj.pose.bones:
             pb = arm_obj.pose.bones[j_name]
@@ -237,6 +242,16 @@ def create_urdf_armature(robot):
                 pb["limit_upper"] = j.limit_upper
             else:
                 pb["limit_upper"] = 3.14159  # Fallback
+
+            if j.velocity_limit is not None:
+                pb["velocity_limit"] = j.velocity_limit
+            else:
+                pb["velocity_limit"] = 10.0  # Fallback
+
+            if j.type is not None:
+                pb["joint_type"] = j.type
+            else:
+                pb["joint_type"] = "fixed"  # Fallback
 
     return arm_obj, link_mats
 
@@ -462,18 +477,53 @@ def retarget_frame(scene):
             # Use the atan2 formulation for better numerical stability
             val = 2.0 * math.atan2(projection, delta_q.w)
 
-            # CONTINUITY CHECK (Anti-Flip):
+            # JOINT TYPE AWARENESS:
+            # Handle different logic for revolute (rotation) vs prismatic (translation) joints
+            jtype = urdf_b.get("joint_type", "revolute")
+
+            # CONTINUITY CHECK (Anti-Flip) only for revolute/continuous joints:
             # Rotations often jump from +180 to -180 degrees (Pi to -Pi).
             # We track the value over time and add/subtract 2*Pi to keep the motion continuous.
-            cache_val_key = f"val_{cache_key}_{b.bvh_bone_name}"
-            if cache_val_key in smooth_cache:
-                prev_val = smooth_cache[cache_val_key]
-                diff = val - prev_val
-                if diff > math.pi:
-                    val -= 2 * math.pi
-                elif diff < -math.pi:
-                    val += 2 * math.pi
-            smooth_cache[cache_val_key] = val
+            if jtype in ("revolute", "continuous"):
+                cache_val_key = f"val_{cache_key}_{b.bvh_bone_name}"
+                if cache_val_key in smooth_cache:
+                    prev_val = smooth_cache[cache_val_key]
+                    diff = val - prev_val
+                    if diff > math.pi:
+                        val -= 2 * math.pi
+                    elif diff < -math.pi:
+                        val += 2 * math.pi
+                smooth_cache[cache_val_key] = val
+
+            # VELOCITY LIMITING (Rate-Limiting with Damping):
+            # Ensure movement does not exceed the hardware velocity limits.
+            velocity_limit = urdf_b.get("velocity_limit", 10.0)  # Default 10 rad/s
+            last_raw_key = f"last_raw_{cache_key}_{b.bvh_bone_name}"
+            last_raw_val = smooth_cache.get(last_raw_key, val)
+
+            # Calculate raw velocity
+            raw_diff = val - last_raw_val
+            # Re-apply anti-flip correction
+            if jtype in ("revolute", "continuous"):
+                if raw_diff > math.pi:
+                    raw_diff -= 2 * math.pi
+                elif raw_diff < -math.pi:
+                    raw_diff += 2 * math.pi
+
+            target_hz = scene.render.fps if scene.render.fps > 0 else 60.0
+            dt = 1.0 / target_hz
+            current_velocity = abs(raw_diff) / dt
+
+            if current_velocity > velocity_limit and velocity_limit > 0.0:
+                # Apply damping: cap the step size to the maximum allowed velocity
+                max_step = velocity_limit * dt
+                safe_diff = max_step if raw_diff > 0 else -max_step
+                val = last_raw_val + safe_diff
+                urdf_b["is_velocity_limited"] = True
+            else:
+                urdf_b["is_velocity_limited"] = False
+
+            smooth_cache[last_raw_key] = val
 
             # Adjust sign and apply the zero-offset (calibration offset)
             if b.sign == "NEG":
@@ -724,15 +774,25 @@ class UL_URDFBoneList(UIList):
     def draw_item(
         self, context, layout, data, item, icon, active_data, active_propname, index
     ):
-        row = layout.row()
-        if context.scene.urdf_rig_object:
+        urdf_obj = context.scene.urdf_rig_object
+        row = layout.row(align=True)
+
+        # Check if the current URDF bone has reached its velocity limit
+        if urdf_obj and item.bvh_bone_name in urdf_obj.pose.bones:
+            ub = urdf_obj.pose.bones[item.bvh_bone_name]
+            if ub.get("is_velocity_limited"):
+                row.label(text="", icon="ERROR")
+                row.alert = True  # Colors the property field red
+
+        if urdf_obj:
             row.prop_search(
                 item,
                 "bvh_bone_name",
-                context.scene.urdf_rig_object.pose,
+                urdf_obj.pose,
                 "bones",
                 text="",
             )
+
         row.prop(item, "source_axis", text="")
         row.prop(item, "sign", text="")
         row.prop(item, "neutral_offset", text="")
