@@ -419,15 +419,20 @@ def retarget_frame(scene):
     if bvh.pose.bones:
         # Get the global world matrix of the first BVH bone (usually the Pelvis/Hips)
         bvh_root_mat = bvh.matrix_world @ bvh.pose.bones[0].matrix
+        current_bvh_pos = bvh_root_mat.to_translation()
+        current_bvh_rot = bvh_root_mat.to_quaternion()
 
         # Calculate the intended target position, applying scale and user-defined offsets
-        target_loc = (
-            bvh_root_mat.to_translation() * settings.root_scale
-        ) + mathutils.Vector(settings.location_offset)
+        ref_pos = mathutils.Vector(settings.get("ref_root_pos", (0, 0, 0)))
+        delta_vec = current_bvh_pos - ref_pos
+        target_loc = (delta_vec * settings.root_scale) + mathutils.Vector(
+            settings.location_offset
+        )
 
-        # Combine BVH root rotation with a user-defined rotation offset (T-Pose alignment)
+        # Combine BVH root rotation with a user-defined rotation offset (Rest-Pose alignment)
         off_q = mathutils.Euler(settings.rotation_offset).to_quaternion()
-        target_rot = bvh_root_mat.to_quaternion() @ off_q
+        ref_rot = mathutils.Quaternion(settings.get("ref_root_rot", current_bvh_rot))
+        target_rot = (current_bvh_rot @ ref_rot.inverted()) @ off_q
 
         # Apply temporal smoothing to the root to prevent the robot from "shaking"
         if "root_loc_prev" in smooth_cache:
@@ -495,6 +500,14 @@ def retarget_frame(scene):
             if not urdf_b:
                 continue
 
+            # JOINT TYPE AWARENESS:
+            # Handle different logic for revolute (rotation) vs prismatic (translation) joints
+            jtype = urdf_b.get("joint_type", "revolute")
+
+            # Only revolute and continuous joints are supported in this retargeting engine
+            if jtype not in {"revolute", "continuous"}:
+                continue
+
             # ROTATION PROJECTION:
             # 1. Define the twist axis in BVH local space
             if b.source_axis == "X":
@@ -512,10 +525,6 @@ def retarget_frame(scene):
             # 3. Calculate the angle around the twist axis
             # Use the atan2 formulation for better numerical stability
             val = 2.0 * math.atan2(projection, delta_q.w)
-
-            # JOINT TYPE AWARENESS:
-            # Handle different logic for revolute (rotation) vs prismatic (translation) joints
-            jtype = urdf_b.get("joint_type", "revolute")
 
             # CONTINUITY CHECK (Anti-Flip) only for revolute/continuous joints:
             # Rotations often jump from +180 to -180 degrees (Pi to -Pi).
@@ -996,9 +1005,14 @@ class OT_ApplyBVHMapping(Operator):
             scene["_bvh_smooth_cache"] = {}
 
         # 5. Enable the retargeting handler
+        # and set current BVH pose as reference
+        bpy.ops.object.calibrate_rest_pose()
         scene.bvh_mapping_settings.live_retarget = True
+
+        # 6. Burn in frame 0 to ensure all calculations are up to date
         for _ in range(100):
             scene.frame_set(0)
+            context.view_layer.update()
 
         self.report({"INFO"}, "Rig reset to frame 0. Retargeting active.")
         return {"FINISHED"}
@@ -1033,6 +1047,39 @@ class OT_RemoveBVHBone(Operator):
             if i.bvh_bone_name == self.bvh_bone_name
         )
         m.urdf_bones.remove(context.scene.bvh_mapping_settings.active_urdf_index)
+        return {"FINISHED"}
+
+
+class OT_CalibrateRestPose(Operator):
+    """Calibrates the mapping offsets based on the current BVH Pose"""
+
+    bl_idname = "object.calibrate_rest_pose"
+    bl_label = "Calibrate Rest Pose"
+    bl_description = "Saves the current BVH rotation as the neutral reference."
+
+    def execute(self, context):
+        settings = context.scene.bvh_mapping_settings
+        bvh = context.scene.bvh_rig_object
+
+        if not bvh:
+            self.report({"ERROR"}, "No BVH Rig selected!")
+            return {"CANCELLED"}
+
+        # Store the current BVH root position and rotation as reference
+        bvh_root_mat = bvh.matrix_world @ bvh.pose.bones[0].matrix
+        settings["ref_root_pos"] = bvh_root_mat.to_translation().copy()
+        settings["ref_root_rot"] = bvh_root_mat.to_quaternion().copy()
+
+        count = 0
+        # Iterate through all mapping items and store the current BVH bone rotation as reference
+        for item in settings.mappings:
+            bvh_bone = bvh.pose.bones.get(item.bvh_bone_name)
+            if bvh_bone:
+                # Store the current rotation as reference
+                item.ref_rot = bvh_bone.matrix_basis.to_quaternion()
+                count += 1
+
+        self.report({"INFO"}, f"Calibrated {count} bones. Reference set.")
         return {"FINISHED"}
 
 
@@ -1076,6 +1123,7 @@ classes = [
     PANEL_BVHMapping,
     OT_GenerateMappingList,
     OT_ApplyBVHMapping,
+    OT_CalibrateRestPose,
     OT_AddBVHBone,
     OT_RemoveBVHBone,
     OT_ExportBeyondMimic,
