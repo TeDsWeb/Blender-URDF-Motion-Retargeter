@@ -61,6 +61,8 @@ class URDFJoint:
         limit_lower=None,
         limit_upper=None,
         velocity_limit=None,
+        soft_limit_lower=None,
+        soft_limit_upper=None,
     ):
         self.name = name
         self.type = jtype
@@ -72,6 +74,8 @@ class URDFJoint:
         self.limit_lower = limit_lower
         self.limit_upper = limit_upper
         self.velocity_limit = velocity_limit
+        self.soft_limit_lower = soft_limit_lower
+        self.soft_limit_upper = soft_limit_upper
 
 
 class URDFRobot:
@@ -149,8 +153,30 @@ def parse_urdf(path):
         velocity = (
             float(limit_el.get("velocity", 10.0)) if limit_el is not None else 10.0
         )
+        safety_el = joint_el.find("safety_controller")
+        soft_limit_lower = (
+            float(safety_el.attrib.get("soft_lower_limit"))
+            if safety_el is not None and "soft_lower_limit" in safety_el.attrib
+            else None
+        )
+        soft_limit_upper = (
+            float(safety_el.attrib.get("soft_upper_limit"))
+            if safety_el is not None and "soft_upper_limit" in safety_el.attrib
+            else None
+        )
         robot.joints[name] = URDFJoint(
-            name, jtype, parent, child, xyz, rpy, axis, lower, upper, velocity
+            name,
+            jtype,
+            parent,
+            child,
+            xyz,
+            rpy,
+            axis,
+            lower,
+            upper,
+            velocity,
+            soft_limit_lower,
+            soft_limit_upper,
         )
     return robot
 
@@ -242,6 +268,16 @@ def create_urdf_armature(robot):
                 pb["limit_upper"] = j.limit_upper
             else:
                 pb["limit_upper"] = 3.14159  # Fallback
+
+            if j.soft_limit_lower is not None:
+                pb["limit_lower"] = (
+                    j.soft_limit_lower
+                )  # Override with soft limit if available
+
+            if j.soft_limit_upper is not None:
+                pb["limit_upper"] = (
+                    j.soft_limit_upper
+                )  # Override with soft limit if available
 
             if j.velocity_limit is not None:
                 pb["velocity_limit"] = j.velocity_limit
@@ -549,9 +585,10 @@ def retarget_frame(scene):
 
             # JOINT LIMITS:
             # Ensure the angle does not exceed the mechanical limits defined in the URDF.
-            l_min = urdf_b.get("limit_lower", -3.14)
-            l_max = urdf_b.get("limit_upper", 3.14)
-            final_angle = max(min(final_angle, l_max), l_min)
+            if jtype != "continuous":
+                l_min = urdf_b.get("limit_lower", -3.14)
+                l_max = urdf_b.get("limit_upper", 3.14)
+                final_angle = max(min(final_angle, l_max), l_min)
 
             # Store the computed angle for external export scripts
             urdf_b["_joint_angle"] = final_angle
