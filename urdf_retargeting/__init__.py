@@ -623,6 +623,106 @@ class OT_ExportBeyondMimic(Operator):
 
     directory: StringProperty(name="Export Directory", subtype="DIR_PATH")
 
+    # Internal Modal State
+    _timer = None
+    _num_steps = 0
+    _current_step = 0
+    _time_per_step = 0
+    _duration = 0
+    _total_frames = 0
+    _data_rows = []
+    _meta_joints = {}
+    _csv_path = ""
+    _json_path = ""
+    _orig_frame = 0
+    _joints = []
+    _base_name = ""
+
+    def modal(self, context, event):
+        scene = context.scene
+        settings = scene.bvh_mapping_settings
+        urdf = scene.urdf_rig_object
+        fps = scene.render.fps
+
+        if event.type == "ESC":
+            return self.cancel(context)
+
+        if event.type == "TIMER":
+            if self._current_step < self._num_steps:
+                # Calculate current time in seconds
+                current_time_secs = self._current_step * self._time_per_step
+
+                # Map time back to Blender frames (including subframes for precision)
+                blender_frame = scene.frame_start + (current_time_secs * fps)
+
+                # Set frame and subframe (crucial for smooth interpolation)
+                scene.frame_set(int(blender_frame), subframe=blender_frame % 1.0)
+
+                # --- Geometry-Based Grounding ---
+                if settings.auto_grounding:
+                    # We find the absolute lowest Z coordinate across all mesh parts
+                    global_min_z = float("inf")
+                    found_mesh = False
+
+                    # Iterate through all objects parented to the rig (links/visuals)
+                    for child in urdf.children:
+                        if child.type == "MESH":
+                            found_mesh = True
+                            # The bound_box is in local space, we need to transform it to world space
+                            # mesh.bound_box contains 8 corners
+                            matrix_world = child.matrix_world
+                            for corner in child.bound_box:
+                                # Transform local corner to world space
+                                world_corner = matrix_world @ mathutils.Vector(corner)
+                                if world_corner.z < global_min_z:
+                                    global_min_z = world_corner.z
+
+                    # Fallback: If no meshes are found, use the bone heads as a safety measure
+                    if not found_mesh:
+                        global_min_z = min(
+                            (urdf.matrix_world @ pb.head).z for pb in urdf.pose.bones
+                        )
+
+                    # Subtract the lowest point from the root's Z position
+                    # This snaps the "sole" of the robot's foot to exactly Z=0
+                    urdf.location.z -= global_min_z
+
+                # Collect Root Data
+                row = [
+                    urdf.location.x,
+                    urdf.location.y,
+                    urdf.location.z,
+                    urdf.rotation_quaternion.x,
+                    urdf.rotation_quaternion.y,
+                    urdf.rotation_quaternion.z,
+                    urdf.rotation_quaternion.w,
+                ]
+
+                # Collect Joint Data
+                for j in self._joints:
+                    pb = urdf.pose.bones[j]
+                    row.append(pb.get("_joint_angle", 0.0))
+                    if self._current_step == 0:
+                        # Metadata (limits) only needed once
+                        self._meta_joints[j] = {
+                            "lower": pb.get("limit_lower", -3.14),
+                            "upper": pb.get("limit_upper", 3.14),
+                        }
+
+                self._data_rows.append(row)
+
+                # UI Update
+                context.workspace.status_text_set(
+                    f"Export Beyond Mimic: Step {self._current_step}/{self._num_steps} | ESC to Cancel"
+                )
+                context.window_manager.progress_update(self._current_step)
+
+                self._current_step += 1
+            else:
+                return self.finish(context)
+
+        return {"RUNNING_MODAL"}
+
     def execute(self, context):
         scene = context.scene
         settings = scene.bvh_mapping_settings
@@ -632,23 +732,39 @@ class OT_ExportBeyondMimic(Operator):
             self.report({"ERROR"}, "Robot, BVH Rig or Directory missing!")
             return {"CANCELLED"}
 
-        # 1. Prepare Paths
-        base_name = bpy.path.clean_name(bvh.name)
-        csv_path = os.path.join(self.directory, f"{base_name}.csv")
-        json_path = os.path.join(self.directory, f"{base_name}_meta.json")
+        # Initialize Paths
+        self._base_name = bpy.path.clean_name(bvh.name)
+        self._csv_path = os.path.join(self.directory, f"{self._base_name}.csv")
+        self._json_path = os.path.join(self.directory, f"{self._base_name}_meta.json")
 
-        # 2. Resampling Setup
-        # Calculate total duration in seconds
+        # Resampling Setup
         fps = scene.render.fps
-        total_frames = scene.frame_end - scene.frame_start
-        duration = total_frames / fps
-
-        # Calculate total steps based on target Hz
+        self._total_frames = scene.frame_end - scene.frame_start
+        self._duration = self._total_frames / fps
         target_hz = settings.target_hz
-        num_steps = int(duration * target_hz) + 1
-        time_per_step = 1.0 / target_hz
+        self._num_steps = int(self._duration * target_hz) + 1
+        self._time_per_step = 1.0 / target_hz
 
-        joints = list(urdf.get("urdf_joint_order", []))
+        self._joints = list(urdf.get("urdf_joint_order", []))
+        self._current_step = 0
+        self._data_rows = []
+        self._meta_joints = {}
+        self._orig_frame = scene.frame_current
+
+        # Modal Setup
+        wm = context.window_manager
+        wm.progress_begin(0, self._num_steps)
+        self._timer = wm.event_timer_add(0.001, window=context.window)
+        wm.modal_handler_add(self)
+
+        return {"RUNNING_MODAL"}
+
+    def finish(self, context):
+        scene = context.scene
+        settings = scene.bvh_mapping_settings
+        urdf = scene.urdf_rig_object
+
+        # Create CSV Header
         header = [
             "root_tx",
             "root_ty",
@@ -657,95 +773,27 @@ class OT_ExportBeyondMimic(Operator):
             "root_qy",
             "root_qz",
             "root_qw",
-        ] + joints
+        ] + self._joints
 
-        data_rows, meta_joints = [], {}
-        orig_f = scene.frame_current
-
-        # 3. Sampling Loop (Time-based Resampling)
-        for step in range(num_steps):
-            # Calculate current time in seconds
-            current_time_secs = step * time_per_step
-
-            # Map time back to Blender frames (including subframes for precision)
-            blender_frame = scene.frame_start + (current_time_secs * fps)
-
-            # Set frame and subframe (crucial for smooth interpolation)
-            scene.frame_set(int(blender_frame), subframe=blender_frame % 1.0)
-
-            # --- Geometry-Based Grounding ---
-            if settings.auto_grounding:
-                # We find the absolute lowest Z coordinate across all mesh parts
-                global_min_z = float("inf")
-                found_mesh = False
-
-                # Iterate through all objects parented to the rig (links/visuals)
-                for child in urdf.children:
-                    if child.type == "MESH":
-                        found_mesh = True
-                        # The bound_box is in local space, we need to transform it to world space
-                        # mesh.bound_box contains 8 corners
-                        matrix_world = child.matrix_world
-                        for corner in child.bound_box:
-                            # Transform local corner to world space
-                            world_corner = matrix_world @ mathutils.Vector(corner)
-                            if world_corner.z < global_min_z:
-                                global_min_z = world_corner.z
-
-                # Fallback: If no meshes are found, use the bone heads as a safety measure
-                if not found_mesh:
-                    global_min_z = min(
-                        (urdf.matrix_world @ pb.head).z for pb in urdf.pose.bones
-                    )
-
-                # Subtract the lowest point from the root's Z position
-                # This snaps the "sole" of the robot's foot to exactly Z=0
-                urdf.location.z -= global_min_z
-
-            # Collect Root Data
-            row = [
-                urdf.location.x,
-                urdf.location.y,
-                urdf.location.z,
-                urdf.rotation_quaternion.x,
-                urdf.rotation_quaternion.y,
-                urdf.rotation_quaternion.z,
-                urdf.rotation_quaternion.w,
-            ]
-
-            # Collect Joint Data
-            for j in joints:
-                pb = urdf.pose.bones[j]
-                row.append(pb.get("_joint_angle", 0.0))
-
-                # Metadata (limits) only needed once
-                if step == 0:
-                    meta_joints[j] = {
-                        "lower": pb.get("limit_lower", -3.14),
-                        "upper": pb.get("limit_upper", 3.14),
-                    }
-
-            data_rows.append(row)
-
-        # 4. Write Files
+        # Write CSV and JSON Files
         try:
-            with open(csv_path, "w", newline="") as f:
+            with open(self._csv_path, "w", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow(header)
-                writer.writerows(data_rows)
+                writer.writerows(self._data_rows)
 
-            with open(json_path, "w") as f:
+            with open(self._json_path, "w") as f:
                 json.dump(
                     {
                         # Origin Info
-                        "source_bvh": base_name,
+                        "source_bvh": self._base_name,
                         "target_urdf": bpy.path.clean_name(urdf.name),
                         # Timing
-                        "source_fps": fps,
-                        "source_total_frames": total_frames,
-                        "export_hz": target_hz,
-                        "duration_secs": duration,
-                        "total_samples": len(data_rows),
+                        "source_fps": scene.render.fps,
+                        "source_total_frames": self._total_frames,
+                        "export_hz": settings.target_hz,
+                        "duration_secs": self._duration,
+                        "total_samples": len(self._data_rows),
                         # Export Settings
                         "bvh_smoothing": settings.bvh_smoothing,
                         "joint_smoothing": settings.joint_smoothing,
@@ -770,10 +818,10 @@ class OT_ExportBeyondMimic(Operator):
                         },
                         # Joint definition
                         "joints": {
-                            "order": joints,
+                            "order": self._joints,
                             "type": "hinge",
                             "angle_unit": "radians",
-                            "limits": meta_joints,
+                            "limits": self._meta_joints,
                         },
                     },
                     f,
@@ -782,15 +830,24 @@ class OT_ExportBeyondMimic(Operator):
 
             self.report(
                 {"INFO"},
-                f"Resampled to {target_hz}Hz: {base_name}.csv and {base_name}_meta.json",
+                f"Export finished: {self._base_name}.csv; {self._base_name}_meta.json",
             )
-
         except Exception as e:
             self.report({"ERROR"}, f"File Error: {str(e)}")
-            return {"CANCELLED"}
 
-        scene.frame_set(orig_f)
+        self.cleanup(context)
         return {"FINISHED"}
+
+    def cancel(self, context):
+        self.cleanup(context)
+        self.report({"WARNING"}, "Export cancelled")
+        return {"CANCELLED"}
+
+    def cleanup(self, context):
+        context.scene.frame_set(self._orig_frame)
+        context.window_manager.event_timer_remove(self._timer)
+        context.window_manager.progress_end()
+        context.workspace.status_text_set(None)
 
     def invoke(self, context, event):
         context.window_manager.fileselect_add(self)
