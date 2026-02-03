@@ -380,8 +380,8 @@ class BVHMappingSettings(PropertyGroup):
         min=0.0,
         max=1.0,
     )
-    foot_l_name: StringProperty(name="Left Foot Bone", default="LeftFoot")
-    foot_r_name: StringProperty(name="Right Foot Bone", default="RightFoot")
+    foot_l_name: StringProperty(name="Left Foot Bone", default="")
+    foot_r_name: StringProperty(name="Right Foot Bone", default="")
     jump_threshold: FloatProperty(
         name="Jump Threshold",
         description="Minimum vertical movement to register a jump (in meters)",
@@ -460,12 +460,13 @@ def retarget_frame(scene):
         current_bvh_rot = bvh_root_mat.to_quaternion()
 
         ref_pos = mathutils.Vector(settings.get("ref_root_pos", current_bvh_pos))
+        bvh_floor_offset = settings.get("bvh_floor_offset", 0.0)
 
-        # Vertical Movement Delta with Jump Thresholding
-        raw_delta_z = (current_bvh_pos.z - ref_pos.z) * settings.root_scale
-        stable_delta_z = (
-            raw_delta_z if abs(raw_delta_z) > settings.jump_threshold else 0.0
-        )
+        # Vertical Movement Delta
+        corrected_current_z = current_bvh_pos.z - bvh_floor_offset
+        delta_z = (
+            corrected_current_z - (ref_pos.z - bvh_floor_offset)
+        ) * settings.root_scale
 
         # --- 1.2 DYNAMIC PIVOT CORRECTION ---
         pivot_correction = mathutils.Vector((0, 0, 0))
@@ -512,7 +513,7 @@ def retarget_frame(scene):
                 + world_pivot_corr.x,
                 (current_bvh_pos.y - ref_pos.y) * settings.root_scale
                 + world_pivot_corr.y,
-                stable_delta_z,
+                delta_z,
             )
         )
 
@@ -879,6 +880,7 @@ class OT_ExportBeyondMimic(Operator):
 
     def invoke(self, context, event):
         context.window_manager.fileselect_add(self)
+        bpy.ops.object.apply_bvh_mapping()  # Ensure final retarget before export
         return {"RUNNING_MODAL"}
 
 
@@ -1321,6 +1323,20 @@ class OT_CalibrateRestPose(Operator):
                 # Store the current rotation as reference
                 item.ref_rot = bvh_bone.matrix_basis.to_quaternion()
                 count += 1
+
+        if (
+            settings.foot_l_name in bvh.pose.bones
+            and settings.foot_r_name in bvh.pose.bones
+        ):
+            lowest_bvh_z = min(
+                (bvh.matrix_world @ bvh.pose.bones.get(settings.foot_l_name).matrix)
+                .to_translation()
+                .z,
+                (bvh.matrix_world @ bvh.pose.bones.get(settings.foot_r_name).matrix)
+                .to_translation()
+                .z,
+            )
+            settings["bvh_floor_offset"] = lowest_bvh_z
 
         self.report({"INFO"}, f"Calibrated {count} bones. Reference set.")
         return {"FINISHED"}
