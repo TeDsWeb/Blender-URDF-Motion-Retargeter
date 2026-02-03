@@ -389,7 +389,9 @@ class BVHMappingSettings(PropertyGroup):
         min=0.0,
     )
     root_scale: FloatProperty(name="Root Scale", default=1.0)
-    location_offset: FloatVectorProperty(name="Loc Offset", subtype="TRANSLATION")
+    location_offset: FloatVectorProperty(
+        name="Loc Offset", subtype="TRANSLATION", size=2, default=(0.0, 0.0)
+    )
     rotation_offset: FloatVectorProperty(name="Rot Offset", subtype="EULER")
     transfer_root_rot: BoolProperty(name="Transfer World Rotation", default=True)
     target_hz: IntProperty(name="Export Hz", default=50, min=1, max=240)
@@ -401,6 +403,7 @@ class BVHMappingSettings(PropertyGroup):
 # ============================================================
 
 
+@persistent
 def get_lowest_z_world(urdf_obj):
     """Finds the lowest Z-coordinate of the visual mesh or bones."""
     # We find the absolute lowest Z coordinate across all mesh parts
@@ -452,49 +455,59 @@ def retarget_frame(scene):
     smooth_cache = scene["_bvh_smooth_cache"]
 
     # --- 1. ROOT POSITION & ROTATION PROJECTION ---
-    # The 'Root' defines the global position/orientation of the robot.
     if bvh.pose.bones:
-        # --- 1.1 GRUNDDATEN & DELTAS ---
+        # --- 1.1 DATA & DELTAS ---
         bvh_root_mat = bvh.matrix_world @ bvh.pose.bones[0].matrix
         current_bvh_pos = bvh_root_mat.to_translation()
         current_bvh_rot = bvh_root_mat.to_quaternion()
 
         ref_pos = mathutils.Vector(settings.get("ref_root_pos", current_bvh_pos))
 
-        # Vertikaler Filter (Jump-Threshold)
+        # Vertical Movement Delta with Jump Thresholding
         raw_delta_z = (current_bvh_pos.z - ref_pos.z) * settings.root_scale
         stable_delta_z = (
             raw_delta_z if abs(raw_delta_z) > settings.jump_threshold else 0.0
         )
 
-        # --- 1.2 DYNAMISCHER PIVOT (Fuß-Logik) ---
-        foot_yaw_diff = 0.0
+        # --- 1.2 DYNAMIC PIVOT CORRECTION ---
         pivot_correction = mathutils.Vector((0, 0, 0))
+        comp_q = mathutils.Quaternion((1, 0, 0, 0))
 
-        # Bestimme Kontakt (Beispiel für Switch-Logik)
+        # Calculate which feet are in contact with the ground (Z <= jump_threshold)
         contacts_bvh = []
         for f_name in [settings.foot_l_name, settings.foot_r_name]:
             bone = bvh.pose.bones.get(f_name)
-            if bone and (bvh.matrix_world @ bone.matrix).to_translation().z < 0.05:
+            if (
+                bone
+                and (bvh.matrix_world @ bone.matrix).to_translation().z
+                <= settings.jump_threshold
+            ):
                 contacts_bvh.append(bone)
 
-        # Wenn exakt ein Fuß steht, berechnen wir den Pivot-Versatz (Yaw-Kompensation)
+        # If only one foot is in contact, use it for pivot correction
         if len(contacts_bvh) == 1:
             stand_foot = contacts_bvh[0]
             foot_world_mat = bvh.matrix_world @ stand_foot.matrix
-            rel_q = current_bvh_rot.inverted() @ foot_world_mat.to_quaternion()
-            foot_yaw_diff = rel_q.to_euler().z
 
-            # Hebelarm für horizontale Korrektur
+            # Relitive difference between root and foot
+            # rel_q is the orientation of the foot relative to the hip
+            rel_q = current_bvh_rot.inverted() @ foot_world_mat.to_quaternion()
+
+            # --- SWING-TWIST DECOMPOSITION ---
+            # Project the twist component (Z) of the quaternion
+            twist_z = mathutils.Quaternion((rel_q.w, 0, 0, rel_q.z)).normalized()
+            comp_q = twist_z  # Yaw compensation only
+
+            # Calculate pivot correction in local BVH space
             foot_local_pos = bvh_root_mat.inverted() @ foot_world_mat.to_translation()
-            rot_q = mathutils.Quaternion((0, 0, 1), foot_yaw_diff)
-            corr = foot_local_pos - (rot_q @ foot_local_pos)
+            # Use only the horizontal (X,Y) components for correction
+            corr = foot_local_pos - (twist_z @ foot_local_pos)
             pivot_correction.x, pivot_correction.y = corr.x, corr.y
 
-        # --- 1.3 POSITIONIERUNG (Hier wird target_loc_preliminary genutzt) ---
+        # --- 1.3 POSITIONIERUNG ---
         world_pivot_corr = current_bvh_rot @ pivot_correction
 
-        # Das ist die vorläufige Position inkl. Pivot und BVH-Delta
+        # Calculate preliminary target location with scaling and pivot correction
         target_loc_preliminary = mathutils.Vector(
             (
                 (current_bvh_pos.x - ref_pos.x) * settings.root_scale
@@ -505,29 +518,27 @@ def retarget_frame(scene):
             )
         )
 
-        # Zuweisung an den Roboter (inkl. manuellem Kalibrierungs-Offset)
-        urdf.location = target_loc_preliminary + mathutils.Vector(
-            settings.location_offset
-        )
+        # Set URDF Root Position with Offset
+        offset_xy = settings.location_offset
+        loc_offset = mathutils.Vector((offset_xy[0], offset_xy[1], 0.0))
+        urdf.location = target_loc_preliminary + loc_offset
 
-        # --- 1.4 ROTATION (Hier wird foot_yaw_diff genutzt) ---
+        # --- 1.4 ROTATION ---
         if settings.transfer_root_rot:
             ref_rot = mathutils.Quaternion(
                 settings.get("ref_root_rot", current_bvh_rot)
             )
             off_q = mathutils.Euler(settings.rotation_offset).to_quaternion()
-            # Kompensation des Fuß-Twists in der Root-Rotation
-            comp_q = mathutils.Euler((0, 0, foot_yaw_diff)).to_quaternion()
-
+            # Compensation of foot twist in the root rotation
             urdf.rotation_quaternion = (
                 (current_bvh_rot @ ref_rot.inverted()) @ off_q @ comp_q
             )
 
         # --- 5. ANTI-SINKING CHECK (Globales Grounding) ---
-        bpy.context.view_layer.update()  # Wichtig: Blender muss die neue Pose erst berechnen
+        bpy.context.view_layer.update()  # Important: Blender needs to update matrices
 
-        current_min_z = get_lowest_z_world(urdf)  # Nutzt die Hilfsfunktion von vorhin
-        if current_min_z < -1e-4:
+        current_min_z = get_lowest_z_world(urdf)
+        if current_min_z < -1e-6:  # Allow a tiny epsilon for numerical stability
             urdf.location.z += abs(current_min_z)
 
     # --- 2. JOINT RETARGETING LOOP ---
@@ -1347,17 +1358,6 @@ class OT_CalibrateRestPose(Operator):
                 # Store the current rotation as reference
                 item.ref_rot = bvh_bone.matrix_basis.to_quaternion()
                 count += 1
-
-        urdf = context.scene.urdf_rig_object
-        if urdf:
-            # Find the lowest Z point of the robot's visual mesh
-            global_min_z = get_lowest_z_world(urdf)
-            # Save the offset to the settings
-            if abs(global_min_z) > 1e-6:
-                self.report(
-                    {"INFO"}, f"Z-Grounding Offset Applied: {-global_min_z:.4f}m"
-                )
-                settings.location_offset.z = -global_min_z
 
         self.report({"INFO"}, f"Calibrated {count} bones. Reference set.")
         return {"FINISHED"}
