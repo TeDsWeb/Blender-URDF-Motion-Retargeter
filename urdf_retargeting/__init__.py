@@ -1221,6 +1221,33 @@ class OT_CalibrateRestPose(Operator):
     bl_label = "Calibrate Rest Pose"
     bl_description = "Saves the current BVH rotation as the neutral reference."
 
+    def get_lowest_point(self, urdf_obj):
+        """Finds the lowest Z-coordinate of the visual mesh or bones."""
+        # We find the absolute lowest Z coordinate across all mesh parts
+        global_min_z = float("inf")
+        found_mesh = False
+
+        # Iterate through all objects parented to the rig (links/visuals)
+        for child in urdf_obj.children:
+            if child.type == "MESH":
+                found_mesh = True
+                # The bound_box is in local space, we need to transform it to world space
+                # mesh.bound_box contains 8 corners
+                matrix_world = child.matrix_world
+                for corner in child.bound_box:
+                    # Transform local corner to world space
+                    world_corner = matrix_world @ mathutils.Vector(corner)
+                    if world_corner.z < global_min_z:
+                        global_min_z = world_corner.z
+
+        # Fallback: If no meshes are found, use the bone heads as a safety measure
+        if not found_mesh:
+            global_min_z = min(
+                (urdf_obj.matrix_world @ pb.head).z for pb in urdf_obj.pose.bones
+            )
+
+        return global_min_z
+
     def execute(self, context):
         settings = context.scene.bvh_mapping_settings
         bvh = context.scene.smoothed_bvh_rig_object
@@ -1242,6 +1269,17 @@ class OT_CalibrateRestPose(Operator):
                 # Store the current rotation as reference
                 item.ref_rot = bvh_bone.matrix_basis.to_quaternion()
                 count += 1
+
+        urdf = context.scene.urdf_rig_object
+        if urdf:
+            # Find the lowest Z point of the robot's visual mesh
+            global_min_z = self.get_lowest_point(urdf)
+            # Save the offset to the settings
+            if abs(global_min_z) > 1e-6:
+                self.report(
+                    {"INFO"}, f"Z-Grounding Offset Applied: {-global_min_z:.4f}m"
+                )
+                settings.location_offset.z = -global_min_z
 
         self.report({"INFO"}, f"Calibrated {count} bones. Reference set.")
         return {"FINISHED"}
