@@ -380,6 +380,14 @@ class BVHMappingSettings(PropertyGroup):
         min=0.0,
         max=1.0,
     )
+    foot_l_name: StringProperty(name="Left Foot Bone", default="LeftFoot")
+    foot_r_name: StringProperty(name="Right Foot Bone", default="RightFoot")
+    jump_threshold: FloatProperty(
+        name="Jump Threshold",
+        description="Minimum vertical movement to register a jump (in meters)",
+        default=0.01,
+        min=0.0,
+    )
     root_scale: FloatProperty(name="Root Scale", default=1.0)
     location_offset: FloatVectorProperty(name="Loc Offset", subtype="TRANSLATION")
     rotation_offset: FloatVectorProperty(name="Rot Offset", subtype="EULER")
@@ -391,6 +399,34 @@ class BVHMappingSettings(PropertyGroup):
 # ============================================================
 # RETARGETING ENGINE
 # ============================================================
+
+
+def get_lowest_z_world(urdf_obj):
+    """Finds the lowest Z-coordinate of the visual mesh or bones."""
+    # We find the absolute lowest Z coordinate across all mesh parts
+    global_min_z = float("inf")
+    found_mesh = False
+
+    # Iterate through all objects parented to the rig (links/visuals)
+    for child in urdf_obj.children:
+        if child.type == "MESH":
+            found_mesh = True
+            # The bound_box is in local space, we need to transform it to world space
+            # mesh.bound_box contains 8 corners
+            matrix_world = child.matrix_world
+            for corner in child.bound_box:
+                # Transform local corner to world space
+                world_corner = matrix_world @ mathutils.Vector(corner)
+                if world_corner.z < global_min_z:
+                    global_min_z = world_corner.z
+
+    # Fallback: If no meshes are found, use the bone heads as a safety measure
+    if not found_mesh:
+        global_min_z = min(
+            (urdf_obj.matrix_world @ pb.head).z for pb in urdf_obj.pose.bones
+        )
+
+    return global_min_z
 
 
 @persistent
@@ -415,30 +451,84 @@ def retarget_frame(scene):
 
     smooth_cache = scene["_bvh_smooth_cache"]
 
-    # --- 1. ROOT POSITION & ROTATION ---
+    # --- 1. ROOT POSITION & ROTATION PROJECTION ---
     # The 'Root' defines the global position/orientation of the robot.
     if bvh.pose.bones:
-        # Get the global world matrix of the first BVH bone (usually the Pelvis/Hips)
+        # --- 1.1 GRUNDDATEN & DELTAS ---
         bvh_root_mat = bvh.matrix_world @ bvh.pose.bones[0].matrix
         current_bvh_pos = bvh_root_mat.to_translation()
         current_bvh_rot = bvh_root_mat.to_quaternion()
 
-        # Calculate the intended target position, applying scale and user-defined offsets
-        ref_pos = mathutils.Vector(settings.get("ref_root_pos", (0, 0, 0)))
-        delta_vec = current_bvh_pos - ref_pos
-        target_loc = (delta_vec * settings.root_scale) + mathutils.Vector(
+        ref_pos = mathutils.Vector(settings.get("ref_root_pos", current_bvh_pos))
+
+        # Vertikaler Filter (Jump-Threshold)
+        raw_delta_z = (current_bvh_pos.z - ref_pos.z) * settings.root_scale
+        stable_delta_z = (
+            raw_delta_z if abs(raw_delta_z) > settings.jump_threshold else 0.0
+        )
+
+        # --- 1.2 DYNAMISCHER PIVOT (Fuß-Logik) ---
+        foot_yaw_diff = 0.0
+        pivot_correction = mathutils.Vector((0, 0, 0))
+
+        # Bestimme Kontakt (Beispiel für Switch-Logik)
+        contacts_bvh = []
+        for f_name in [settings.foot_l_name, settings.foot_r_name]:
+            bone = bvh.pose.bones.get(f_name)
+            if bone and (bvh.matrix_world @ bone.matrix).to_translation().z < 0.05:
+                contacts_bvh.append(bone)
+
+        # Wenn exakt ein Fuß steht, berechnen wir den Pivot-Versatz (Yaw-Kompensation)
+        if len(contacts_bvh) == 1:
+            stand_foot = contacts_bvh[0]
+            foot_world_mat = bvh.matrix_world @ stand_foot.matrix
+            rel_q = current_bvh_rot.inverted() @ foot_world_mat.to_quaternion()
+            foot_yaw_diff = rel_q.to_euler().z
+
+            # Hebelarm für horizontale Korrektur
+            foot_local_pos = bvh_root_mat.inverted() @ foot_world_mat.to_translation()
+            rot_q = mathutils.Quaternion((0, 0, 1), foot_yaw_diff)
+            corr = foot_local_pos - (rot_q @ foot_local_pos)
+            pivot_correction.x, pivot_correction.y = corr.x, corr.y
+
+        # --- 1.3 POSITIONIERUNG (Hier wird target_loc_preliminary genutzt) ---
+        world_pivot_corr = current_bvh_rot @ pivot_correction
+
+        # Das ist die vorläufige Position inkl. Pivot und BVH-Delta
+        target_loc_preliminary = mathutils.Vector(
+            (
+                (current_bvh_pos.x - ref_pos.x) * settings.root_scale
+                + world_pivot_corr.x,
+                (current_bvh_pos.y - ref_pos.y) * settings.root_scale
+                + world_pivot_corr.y,
+                stable_delta_z,
+            )
+        )
+
+        # Zuweisung an den Roboter (inkl. manuellem Kalibrierungs-Offset)
+        urdf.location = target_loc_preliminary + mathutils.Vector(
             settings.location_offset
         )
 
-        # Combine BVH root rotation with a user-defined rotation offset (Rest-Pose alignment)
-        off_q = mathutils.Euler(settings.rotation_offset).to_quaternion()
-        ref_rot = mathutils.Quaternion(settings.get("ref_root_rot", current_bvh_rot))
-        target_rot = (current_bvh_rot @ ref_rot.inverted()) @ off_q
-
-        urdf.location = target_loc
+        # --- 1.4 ROTATION (Hier wird foot_yaw_diff genutzt) ---
         if settings.transfer_root_rot:
-            urdf.rotation_mode = "QUATERNION"
-            urdf.rotation_quaternion = target_rot
+            ref_rot = mathutils.Quaternion(
+                settings.get("ref_root_rot", current_bvh_rot)
+            )
+            off_q = mathutils.Euler(settings.rotation_offset).to_quaternion()
+            # Kompensation des Fuß-Twists in der Root-Rotation
+            comp_q = mathutils.Euler((0, 0, foot_yaw_diff)).to_quaternion()
+
+            urdf.rotation_quaternion = (
+                (current_bvh_rot @ ref_rot.inverted()) @ off_q @ comp_q
+            )
+
+        # --- 5. ANTI-SINKING CHECK (Globales Grounding) ---
+        bpy.context.view_layer.update()  # Wichtig: Blender muss die neue Pose erst berechnen
+
+        current_min_z = get_lowest_z_world(urdf)  # Nutzt die Hilfsfunktion von vorhin
+        if current_min_z < -1e-4:
+            urdf.location.z += abs(current_min_z)
 
     # --- 2. JOINT RETARGETING LOOP ---
     # Iterate through all bone mappings defined in the UI list
@@ -900,6 +990,21 @@ class PANEL_BVHMapping(Panel):
         box.prop(settings, "transfer_root_rot")
         box.prop(settings, "location_offset")
         box.prop(settings, "rotation_offset")
+        box.prop_search(
+            settings,
+            "foot_l_name",
+            context.scene.bvh_rig_object.pose,
+            "bones",
+            text="Left Foot",
+        )
+        box.prop_search(
+            settings,
+            "foot_r_name",
+            context.scene.bvh_rig_object.pose,
+            "bones",
+            text="Right Foot",
+        )
+        box.prop(settings, "jump_threshold")
         box.prop(settings, "bvh_smoothing")
         box.prop(settings, "joint_smoothing")
 
@@ -1221,33 +1326,6 @@ class OT_CalibrateRestPose(Operator):
     bl_label = "Calibrate Rest Pose"
     bl_description = "Saves the current BVH rotation as the neutral reference."
 
-    def get_lowest_point(self, urdf_obj):
-        """Finds the lowest Z-coordinate of the visual mesh or bones."""
-        # We find the absolute lowest Z coordinate across all mesh parts
-        global_min_z = float("inf")
-        found_mesh = False
-
-        # Iterate through all objects parented to the rig (links/visuals)
-        for child in urdf_obj.children:
-            if child.type == "MESH":
-                found_mesh = True
-                # The bound_box is in local space, we need to transform it to world space
-                # mesh.bound_box contains 8 corners
-                matrix_world = child.matrix_world
-                for corner in child.bound_box:
-                    # Transform local corner to world space
-                    world_corner = matrix_world @ mathutils.Vector(corner)
-                    if world_corner.z < global_min_z:
-                        global_min_z = world_corner.z
-
-        # Fallback: If no meshes are found, use the bone heads as a safety measure
-        if not found_mesh:
-            global_min_z = min(
-                (urdf_obj.matrix_world @ pb.head).z for pb in urdf_obj.pose.bones
-            )
-
-        return global_min_z
-
     def execute(self, context):
         settings = context.scene.bvh_mapping_settings
         bvh = context.scene.smoothed_bvh_rig_object
@@ -1273,7 +1351,7 @@ class OT_CalibrateRestPose(Operator):
         urdf = context.scene.urdf_rig_object
         if urdf:
             # Find the lowest Z point of the robot's visual mesh
-            global_min_z = self.get_lowest_point(urdf)
+            global_min_z = get_lowest_z_world(urdf)
             # Save the offset to the settings
             if abs(global_min_z) > 1e-6:
                 self.report(
