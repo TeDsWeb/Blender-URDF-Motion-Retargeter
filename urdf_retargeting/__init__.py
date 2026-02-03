@@ -376,7 +376,7 @@ class BVHMappingSettings(PropertyGroup):
     joint_smoothing: FloatProperty(
         name="Joint Smoothing",
         description="Low-pass EMA filter on joint angles (actuator space)",
-        default=0.9,
+        default=0.1,
         min=0.0,
         max=1.0,
     )
