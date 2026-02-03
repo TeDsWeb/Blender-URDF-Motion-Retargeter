@@ -29,6 +29,7 @@ from bpy.props import (
 )
 from bpy.types import PropertyGroup, Operator, Panel, UIList
 from bpy.app.handlers import persistent
+from bpy_extras.anim_utils import action_get_channelbag_for_slot
 
 # ============================================================
 # URDF DATA STRUCTURES & PARSER
@@ -367,14 +368,14 @@ class BVHMappingSettings(PropertyGroup):
     live_retarget: BoolProperty(name="Live Retargeting")
     bvh_smoothing: FloatProperty(
         name="BVH Smoothing",
-        description="Low-pass filter on BVH joint angles (source space)",
+        description="Zero-Lag SLERP/LERP filter on BVH joint angles (source space)",
         default=0.9,
         min=0.0,
         max=1.0,
     )
     joint_smoothing: FloatProperty(
         name="Joint Smoothing",
-        description="Low-pass filter on joint angles (actuator space)",
+        description="Low-pass EMA filter on joint angles (actuator space)",
         default=0.9,
         min=0.0,
         max=1.0,
@@ -402,7 +403,7 @@ def retarget_frame(scene):
     if not settings.live_retarget:
         return
 
-    urdf, bvh = scene.urdf_rig_object, scene.bvh_rig_object
+    urdf, bvh = scene.urdf_rig_object, scene.smoothed_bvh_rig_object
     if not urdf or not bvh:
         return
 
@@ -414,7 +415,7 @@ def retarget_frame(scene):
 
     smooth_cache = scene["_bvh_smooth_cache"]
 
-    # --- 1. ROOT POSITION & ROTATION SMOOTHING ---
+    # --- 1. ROOT POSITION & ROTATION ---
     # The 'Root' defines the global position/orientation of the robot.
     if bvh.pose.bones:
         # Get the global world matrix of the first BVH bone (usually the Pelvis/Hips)
@@ -434,36 +435,10 @@ def retarget_frame(scene):
         ref_rot = mathutils.Quaternion(settings.get("ref_root_rot", current_bvh_rot))
         target_rot = (current_bvh_rot @ ref_rot.inverted()) @ off_q
 
-        # Apply temporal smoothing to the root to prevent the robot from "shaking"
-        if "root_loc_prev" in smooth_cache:
-            # Alpha: 1.0 means instant movement, near 0.0 means heavy lag/smoothing
-            alpha = 1.0 - settings.bvh_smoothing
-
-            # Linear Interpolation (Lerp) for the X, Y, Z coordinates
-            prev_loc = mathutils.Vector(smooth_cache["root_loc_prev"])
-            urdf.location = prev_loc.lerp(target_loc, alpha)
-
-            # Spherical Linear Interpolation (Slerp) for the rotation
-            if settings.transfer_root_rot:
-                prev_rot = mathutils.Quaternion(smooth_cache["root_rot_prev"])
-
-                # Check dot product to ensure Slerp takes the shortest path between orientations
-                if prev_rot.dot(target_rot) < 0:
-                    target_rot.negate()
-
-                urdf.rotation_mode = "QUATERNION"
-                urdf.rotation_quaternion = prev_rot.slerp(target_rot, alpha)
-        else:
-            # First frame initialization: set position/rotation instantly without smoothing
-            urdf.location = target_loc
-            if settings.transfer_root_rot:
-                urdf.rotation_mode = "QUATERNION"
-                urdf.rotation_quaternion = target_rot
-
-        # Store results in cache for the next frame calculation
-        smooth_cache["root_loc_prev"] = urdf.location.copy()
+        urdf.location = target_loc
         if settings.transfer_root_rot:
-            smooth_cache["root_rot_prev"] = urdf.rotation_quaternion.copy()
+            urdf.rotation_mode = "QUATERNION"
+            urdf.rotation_quaternion = target_rot
 
     # --- 2. JOINT RETARGETING LOOP ---
     # Iterate through all bone mappings defined in the UI list
@@ -472,25 +447,11 @@ def retarget_frame(scene):
         if not bvh_b:
             continue
 
-        # INPUT SMOOTHING:
-        # Smooth the raw incoming BVH bone rotation before extracting specific angles.
-        current_q = bvh_b.matrix_basis.to_quaternion()
-        cache_key = f"{bvh.name}:{bvh_b.name}"
-
-        if cache_key in smooth_cache:
-            prev_q = mathutils.Quaternion(smooth_cache[cache_key])
-            if prev_q.dot(current_q) < 0:
-                current_q.negate()
-            # Apply Slerp based on the user-defined BVH smoothing factor
-            current_q = prev_q.slerp(current_q, 1.0 - settings.bvh_smoothing)
-
-        # Save smoothed quaternion back to cache
-        smooth_cache[cache_key] = current_q.copy()
-
         # REFERENCE TRANSFORMATION:
         # Calculate the rotation 'delta' relative to the saved reference pose (T-Pose).
         # This isolates the actual movement performed during the animation.
         ref_q = mathutils.Quaternion(item.ref_rot)
+        current_q = bvh_b.matrix_basis.to_quaternion()
         delta_q = ref_q.inverted() @ current_q
 
         # --- 3. TRANSFORMATION & EXTRAKTION ---
@@ -530,7 +491,7 @@ def retarget_frame(scene):
             # Rotations often jump from +180 to -180 degrees (Pi to -Pi).
             # We track the value over time and add/subtract 2*Pi to keep the motion continuous.
             if jtype in ("revolute", "continuous"):
-                cache_val_key = f"val_{cache_key}_{b.bvh_bone_name}"
+                cache_val_key = f"val_{bvh.name}_{b.bvh_bone_name}"
                 if cache_val_key in smooth_cache:
                     prev_val = smooth_cache[cache_val_key]
                     diff = val - prev_val
@@ -543,7 +504,7 @@ def retarget_frame(scene):
             # VELOCITY LIMITING (Rate-Limiting with Damping):
             # Ensure movement does not exceed the hardware velocity limits.
             velocity_limit = urdf_b.get("velocity_limit", 10.0)  # Default 10 rad/s
-            last_raw_key = f"last_raw_{cache_key}_{b.bvh_bone_name}"
+            last_raw_key = f"last_raw_{bvh.name}_{b.bvh_bone_name}"
             last_raw_val = smooth_cache.get(last_raw_key, val)
 
             # Calculate raw velocity
@@ -726,7 +687,7 @@ class OT_ExportBeyondMimic(Operator):
     def execute(self, context):
         scene = context.scene
         settings = scene.bvh_mapping_settings
-        urdf, bvh = scene.urdf_rig_object, scene.bvh_rig_object
+        urdf, bvh = scene.urdf_rig_object, scene.smoothed_bvh_rig_object
 
         if not urdf or not bvh or not self.directory:
             self.report({"ERROR"}, "Robot, BVH Rig or Directory missing!")
@@ -1031,8 +992,134 @@ class OT_ApplyBVHMapping(Operator):
     bl_label = "Apply Mapping"
     bl_description = "Resets rig to neutral pose at frame 0 and starts live retargeting"
 
+    def check_bvh_rotation_mode(self, bvh_obj):
+        """Checks if all bones in the BVH armature use QUATERNION rotation mode."""
+        if bvh_obj.type != "ARMATURE":
+            return False
+
+        # Check each bone's rotation mode
+        for pbone in bvh_obj.pose.bones:
+            if pbone.rotation_mode != "QUATERNION":
+                return False
+        return True
+
+    def apply_zero_lag_smoothing(self, context, bvh_obj, smoothing_factor):
+        """Creates a copie of the BVH object and applies Zero-Lag Smoothing it's F-Curves."""
+        # 1. Remove existing smoothed object if present
+        smoothed_name = f"{bvh_obj.name}_smoothed"
+        if smoothed_name in bpy.data.objects:
+            bvh_obj.hide_viewport = False
+            context.view_layer.objects.active = bvh_obj
+            bpy.data.objects.remove(bpy.data.objects[smoothed_name], do_unlink=True)
+
+        # 2. Create a copy of the BVH object to apply smoothing
+        new_obj = bvh_obj.copy()
+        new_obj.data = bvh_obj.data.copy()
+        new_obj.name = smoothed_name
+        if bvh_obj.animation_data and bvh_obj.animation_data.action:
+            new_obj.animation_data.action = bvh_obj.animation_data.action.copy()
+
+        context.collection.objects.link(new_obj)
+
+        # Hide original BVH object from viewport and set new as active
+        bvh_obj.hide_viewport = True
+        context.view_layer.objects.active = new_obj
+
+        # 3. Set bone rotation modes to QUATERNION for consistency
+        bpy.ops.object.mode_set(mode="POSE")
+        for pbone in new_obj.pose.bones:
+            pbone.rotation_mode = "QUATERNION"
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+        action = new_obj.animation_data.action
+        slot = new_obj.animation_data.action_slot
+        channelbag = action_get_channelbag_for_slot(action, slot)
+        if not channelbag:
+            return new_obj
+
+        # 4. Group F-Curves by Data Path
+        # Example: "pose.bones["Root"].location" or "...rotation_quaternion"
+        curves_by_group = {}
+        for fc in channelbag.fcurves:
+            key = fc.data_path
+            if key not in curves_by_group:
+                curves_by_group[key] = []
+            curves_by_group[key].append(fc)
+
+        # 5. Apply Zero-Lag Smoothing
+        alpha = 1.0 - smoothing_factor
+        for path, curves in curves_by_group.items():
+            curves.sort(key=lambda x: x.array_index)
+            num_keys = len(curves[0].keyframe_points)
+            if num_keys < 2:
+                continue
+
+            is_quat = "rotation_quaternion" in path
+            is_loc = "location" in path
+
+            # Only process Quaternion rotations or Location vectors
+            if not (is_quat or is_loc):
+                continue
+
+            # Load keyframe data into arrays
+            all_data = []
+            for fc in curves:
+                coords = [0.0] * (num_keys * 2)
+                fc.keyframe_points.foreach_get("co", coords)
+                all_data.append(coords)
+
+            # Convert keyframe data to mathutils types
+            points = []
+            for i in range(num_keys):
+                idx = i * 2 + 1
+                if is_quat and len(curves) == 4:
+                    points.append(
+                        mathutils.Quaternion(
+                            (
+                                all_data[0][idx],
+                                all_data[1][idx],
+                                all_data[2][idx],
+                                all_data[3][idx],
+                            )
+                        )
+                    )
+                else:  # Location (3D Vector)
+                    points.append(
+                        mathutils.Vector(
+                            (all_data[0][idx], all_data[1][idx], all_data[2][idx])
+                        )
+                    )
+
+            # --- Core Zero-Lag Smoothing ---
+            smoothed = [p.copy() for p in points]
+
+            # Forward Pass
+            for i in range(1, num_keys):
+                if is_quat:
+                    smoothed[i] = smoothed[i - 1].slerp(points[i], alpha)
+                else:
+                    smoothed[i] = smoothed[i - 1].lerp(points[i], alpha)
+
+            # Backward Pass (Zero-Lag)
+            for i in range(num_keys - 2, -1, -1):
+                if is_quat:
+                    smoothed[i] = smoothed[i + 1].slerp(smoothed[i], alpha)
+                else:
+                    smoothed[i] = smoothed[i + 1].lerp(smoothed[i], alpha)
+
+            # Write back smoothed data
+            for i, fc in enumerate(curves):
+                for k in range(num_keys):
+                    all_data[i][k * 2 + 1] = smoothed[k][i]
+                fc.keyframe_points.foreach_set("co", all_data[i])
+                fc.update()
+
+        return new_obj
+
     def execute(self, context):
         scene = context.scene
+        settings = scene.bvh_mapping_settings
+        bvh_obj = scene.bvh_rig_object
         urdf_obj = scene.urdf_rig_object
 
         # 1. Reset timeline to start
@@ -1063,7 +1150,27 @@ class OT_ApplyBVHMapping(Operator):
 
         # 5. Enable the retargeting handler
         # and set current BVH pose as reference
-        bpy.ops.object.calibrate_rest_pose()
+        scene.bvh_mapping_settings.live_retarget = (
+            False  # Temporarily disable to avoid interference
+        )
+        if settings.bvh_smoothing > 0.0:
+            if not self.check_bvh_rotation_mode(bvh_obj):
+                self.report(
+                    {"ERROR"},
+                    "Smoothing requires BVH-Rig to be imported with Quaternion rotations!",
+                )
+                return {"CANCELLED"}
+
+            self.report(
+                {"INFO"},
+                f"Zero-Lag Smoothing BVH Animation (Factor: {settings.bvh_smoothing})...",
+            )
+            scene.smoothed_bvh_rig_object = self.apply_zero_lag_smoothing(
+                context, bvh_obj, settings.bvh_smoothing
+            )
+        else:
+            scene.smoothed_bvh_rig_object = bvh_obj
+        bpy.ops.object.calibrate_rest_pose()  # Sets reference pose on smmoothed BVH
         scene.bvh_mapping_settings.live_retarget = True
 
         # 6. Burn in frame 0 to ensure all calculations are up to date
@@ -1116,7 +1223,7 @@ class OT_CalibrateRestPose(Operator):
 
     def execute(self, context):
         settings = context.scene.bvh_mapping_settings
-        bvh = context.scene.bvh_rig_object
+        bvh = context.scene.smoothed_bvh_rig_object
 
         if not bvh:
             self.report({"ERROR"}, "No BVH Rig selected!")
@@ -1194,6 +1301,7 @@ def register():
     bpy.types.Scene.bvh_mapping_settings = PointerProperty(type=BVHMappingSettings)
     bpy.types.Scene.urdf_rig_object = PointerProperty(type=bpy.types.Object)
     bpy.types.Scene.bvh_rig_object = PointerProperty(type=bpy.types.Object)
+    bpy.types.Scene.smoothed_bvh_rig_object = PointerProperty(type=bpy.types.Object)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
     bpy.app.handlers.frame_change_post.append(retarget_frame)
 
