@@ -393,9 +393,7 @@ class BVHMappingSettings(PropertyGroup):
         name="Loc Offset", subtype="TRANSLATION", size=2, default=(0.0, 0.0)
     )
     rotation_offset: FloatVectorProperty(name="Rot Offset", subtype="EULER")
-    transfer_root_rot: BoolProperty(name="Transfer World Rotation", default=True)
     target_hz: IntProperty(name="Export Hz", default=50, min=1, max=240)
-    auto_grounding: BoolProperty(name="Auto Grounding", default=True)
 
 
 # ============================================================
@@ -524,15 +522,12 @@ def retarget_frame(scene):
         urdf.location = target_loc_preliminary + loc_offset
 
         # --- 1.4 ROTATION ---
-        if settings.transfer_root_rot:
-            ref_rot = mathutils.Quaternion(
-                settings.get("ref_root_rot", current_bvh_rot)
-            )
-            off_q = mathutils.Euler(settings.rotation_offset).to_quaternion()
-            # Compensation of foot twist in the root rotation
-            urdf.rotation_quaternion = (
-                (current_bvh_rot @ ref_rot.inverted()) @ off_q @ comp_q
-            )
+        ref_rot = mathutils.Quaternion(settings.get("ref_root_rot", current_bvh_rot))
+        off_q = mathutils.Euler(settings.rotation_offset).to_quaternion()
+        # Compensation of foot twist in the root rotation
+        urdf.rotation_quaternion = (
+            (current_bvh_rot @ ref_rot.inverted()) @ off_q @ comp_q
+        )
 
         # --- 5. ANTI-SINKING CHECK (Globales Grounding) ---
         bpy.context.view_layer.update()  # Important: Blender needs to update matrices
@@ -702,7 +697,6 @@ class OT_ExportBeyondMimic(Operator):
 
     def modal(self, context, event):
         scene = context.scene
-        settings = scene.bvh_mapping_settings
         urdf = scene.urdf_rig_object
         fps = scene.render.fps
 
@@ -719,35 +713,6 @@ class OT_ExportBeyondMimic(Operator):
 
                 # Set frame and subframe (crucial for smooth interpolation)
                 scene.frame_set(int(blender_frame), subframe=blender_frame % 1.0)
-
-                # --- Geometry-Based Grounding ---
-                if settings.auto_grounding:
-                    # We find the absolute lowest Z coordinate across all mesh parts
-                    global_min_z = float("inf")
-                    found_mesh = False
-
-                    # Iterate through all objects parented to the rig (links/visuals)
-                    for child in urdf.children:
-                        if child.type == "MESH":
-                            found_mesh = True
-                            # The bound_box is in local space, we need to transform it to world space
-                            # mesh.bound_box contains 8 corners
-                            matrix_world = child.matrix_world
-                            for corner in child.bound_box:
-                                # Transform local corner to world space
-                                world_corner = matrix_world @ mathutils.Vector(corner)
-                                if world_corner.z < global_min_z:
-                                    global_min_z = world_corner.z
-
-                    # Fallback: If no meshes are found, use the bone heads as a safety measure
-                    if not found_mesh:
-                        global_min_z = min(
-                            (urdf.matrix_world @ pb.head).z for pb in urdf.pose.bones
-                        )
-
-                    # Subtract the lowest point from the root's Z position
-                    # This snaps the "sole" of the robot's foot to exactly Z=0
-                    urdf.location.z -= global_min_z
 
                 # Collect Root Data
                 row = [
@@ -788,7 +753,7 @@ class OT_ExportBeyondMimic(Operator):
     def execute(self, context):
         scene = context.scene
         settings = scene.bvh_mapping_settings
-        urdf, bvh = scene.urdf_rig_object, scene.smoothed_bvh_rig_object
+        urdf, bvh = scene.urdf_rig_object, scene.bvh_rig_object
 
         if not urdf or not bvh or not self.directory:
             self.report({"ERROR"}, "Robot, BVH Rig or Directory missing!")
@@ -910,6 +875,7 @@ class OT_ExportBeyondMimic(Operator):
         context.window_manager.event_timer_remove(self._timer)
         context.window_manager.progress_end()
         context.workspace.status_text_set(None)
+        bpy.ops.object.apply_bvh_mapping()  # Final retarget to restore state
 
     def invoke(self, context, event):
         context.window_manager.fileselect_add(self)
@@ -998,7 +964,6 @@ class PANEL_BVHMapping(Panel):
         box = layout.box()
         box.label(text="BVH → URDF Options")
         box.prop(settings, "root_scale")
-        box.prop(settings, "transfer_root_rot")
         box.prop(settings, "location_offset")
         box.prop(settings, "rotation_offset")
         box.prop_search(
@@ -1019,7 +984,6 @@ class PANEL_BVHMapping(Panel):
         box.prop(settings, "bvh_smoothing")
         box.prop(settings, "joint_smoothing")
 
-        layout.prop(settings, "live_retarget", toggle=True)
         layout.operator("object.generate_mapping_list")
         if not settings.mappings:
             layout.label(
@@ -1070,7 +1034,6 @@ class PANEL_BVHMapping(Panel):
         box = layout.box()
         box.label(text="Export Beyond Mimic", icon="EXPORT")
         box.prop(settings, "target_hz")
-        box.prop(settings, "auto_grounding")
         box.operator("object.export_beyond_mimic", text="Export")
 
 
