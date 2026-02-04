@@ -527,7 +527,7 @@ def retarget_frame(scene):
         off_q = mathutils.Euler(settings.rotation_offset).to_quaternion()
         # Compensation of foot twist in the root rotation
         urdf.rotation_quaternion = (
-            (current_bvh_rot @ ref_rot.inverted()) @ off_q @ comp_q
+            off_q @ (current_bvh_rot @ ref_rot.inverted()) @ comp_q
         )
 
         # --- 5. ANTI-SINKING CHECK (Globales Grounding) ---
