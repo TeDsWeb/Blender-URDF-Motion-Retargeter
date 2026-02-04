@@ -526,6 +526,7 @@ def retarget_frame(scene):
         ref_rot = mathutils.Quaternion(settings.get("ref_root_rot", current_bvh_rot))
         off_q = mathutils.Euler(settings.rotation_offset).to_quaternion()
         # Compensation of foot twist in the root rotation
+        urdf.rotation_mode = "QUATERNION"
         urdf.rotation_quaternion = (
             off_q @ (current_bvh_rot @ ref_rot.inverted()) @ comp_q
         )
