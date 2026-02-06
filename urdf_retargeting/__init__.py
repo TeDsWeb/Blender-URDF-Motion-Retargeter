@@ -567,7 +567,9 @@ def retarget_frame(scene):
 
         # Set URDF Root Position with Offset
         offset_xy = settings.location_offset
-        loc_offset = mathutils.Vector((offset_xy[0], offset_xy[1], 0.0))
+        loc_offset = mathutils.Vector(
+            (offset_xy[0], offset_xy[1], scene.get("urdf_height_offset", 0.0))
+        )
         urdf.location = target_loc + loc_offset
 
         # --- 1.4 ROTATION ---
@@ -582,9 +584,9 @@ def retarget_frame(scene):
         # --- 5. ANTI-SINKING CHECK (Globales Grounding) ---
         bpy.context.view_layer.update()  # Important: Blender needs to update matrices
 
-        current_min_z = get_lowest_z_world(urdf)
-        if current_min_z < -1e-6:  # Allow a tiny epsilon for numerical stability
-            urdf.location.z += abs(current_min_z)
+        # current_min_z = get_lowest_z_world(urdf)
+        # if current_min_z < -1e-6:  # Allow a tiny epsilon for numerical stability
+        #     urdf.location.z += abs(current_min_z)
 
     # --- 3. JOINT RETARGETING LOOP ---
     # Iterate through all bone mappings defined in the UI list
@@ -1357,9 +1359,13 @@ class OT_CalibrateRestPose(Operator):
         scene = context.scene
         settings = context.scene.bvh_mapping_settings
         bvh = context.scene.smoothed_bvh_rig_object
+        urdf = context.scene.urdf_rig_object
 
         if not bvh:
             self.report({"ERROR"}, "No BVH Rig selected!")
+            return {"CANCELLED"}
+        if not urdf:
+            self.report({"ERROR"}, "No URDF Rig selected!")
             return {"CANCELLED"}
 
         # Store the current BVH root position and rotation as reference
@@ -1389,6 +1395,8 @@ class OT_CalibrateRestPose(Operator):
                 .z,
             )
             scene["bvh_floor_offset"] = lowest_bvh_z
+
+            scene["urdf_height_offset"] = abs(get_lowest_z_world(urdf))
 
         self.report({"INFO"}, f"Calibrated {count} bones. Reference set.")
         return {"FINISHED"}
