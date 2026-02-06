@@ -347,7 +347,7 @@ def bind_meshes(robot, arm_obj, link_mats, base_path):
 
 
 class BVHMappingBone(PropertyGroup):
-    bvh_bone_name: StringProperty(name="URDF Bone")
+    urdf_bone_name: StringProperty(name="URDF Bone")
     source_axis: EnumProperty(
         items=[("X", "X", ""), ("Y", "Y", ""), ("Z", "Z", "")], default="X"
     )
@@ -484,7 +484,7 @@ def retarget_frame(scene):
                     for item in settings.mappings:
                         for u_bone in item.urdf_bones:
                             if item.bvh_bone_name == f_name:
-                                current_contact_names.append(u_bone.bvh_bone_name)
+                                current_contact_names.append(u_bone.urdf_bone_name)
                     current_contact_names = sorted(current_contact_names)
 
                     # Positionen dieser URDF-Bones im Weltraum sammeln
@@ -595,7 +595,7 @@ def retarget_frame(scene):
         if current_min_z < -1e-6:  # Allow a tiny epsilon for numerical stability
             urdf.location.z += abs(current_min_z)
 
-    # --- 2. JOINT RETARGETING LOOP ---
+    # --- 3. JOINT RETARGETING LOOP ---
     # Iterate through all bone mappings defined in the UI list
     for item in settings.mappings:
         bvh_b = bvh.pose.bones.get(item.bvh_bone_name)
@@ -612,7 +612,7 @@ def retarget_frame(scene):
         # --- 3. TRANSFORMATION & EXTRAKTION ---
         # A single BVH bone might drive multiple URDF joints (e.g., Shoulder X and Y)
         for b in item.urdf_bones:
-            urdf_b = urdf.pose.bones.get(b.bvh_bone_name)
+            urdf_b = urdf.pose.bones.get(b.urdf_bone_name)
             if not urdf_b:
                 continue
 
@@ -646,7 +646,7 @@ def retarget_frame(scene):
             # Rotations often jump from +180 to -180 degrees (Pi to -Pi).
             # We track the value over time and add/subtract 2*Pi to keep the motion continuous.
             if jtype in ("revolute", "continuous"):
-                cache_val_key = f"val_{bvh.name}_{b.bvh_bone_name}"
+                cache_val_key = f"val_{bvh.name}_{b.urdf_bone_name}"
                 if cache_val_key in smooth_cache:
                     prev_val = smooth_cache[cache_val_key]
                     diff = val - prev_val
@@ -659,7 +659,7 @@ def retarget_frame(scene):
             # VELOCITY LIMITING (Rate-Limiting with Damping):
             # Ensure movement does not exceed the hardware velocity limits.
             velocity_limit = urdf_b.get("velocity_limit", 10.0)  # Default 10 rad/s
-            last_raw_key = f"last_raw_{bvh.name}_{b.bvh_bone_name}"
+            last_raw_key = f"last_raw_{bvh.name}_{b.urdf_bone_name}"
             last_raw_val = smooth_cache.get(last_raw_key, val)
 
             # Calculate raw velocity
@@ -969,8 +969,8 @@ class UL_URDFBoneList(UIList):
         row = layout.row(align=True)
 
         # Check if the current URDF bone has reached its velocity limit
-        if urdf_obj and item.bvh_bone_name in urdf_obj.pose.bones:
-            ub = urdf_obj.pose.bones[item.bvh_bone_name]
+        if urdf_obj and item.urdf_bone_name in urdf_obj.pose.bones:
+            ub = urdf_obj.pose.bones[item.urdf_bone_name]
             if ub.get("is_velocity_limited"):
                 row.label(text="", icon="ERROR")
                 row.alert = True  # Colors the property field red
@@ -978,7 +978,7 @@ class UL_URDFBoneList(UIList):
         if urdf_obj:
             row.prop_search(
                 item,
-                "bvh_bone_name",
+                "urdf_bone_name",
                 urdf_obj.pose,
                 "bones",
                 text="",
@@ -1003,7 +1003,7 @@ class PANEL_BVHMapping(Panel):
 
         for item in settings.mappings:
             for u_bone in item.urdf_bones:
-                name = u_bone.bvh_bone_name  # URDF joint name
+                name = u_bone.urdf_bone_name  # URDF joint name
                 if name:
                     if name in used_urdf_bones:
                         used_urdf_bones[name].append(item.bvh_bone_name)
