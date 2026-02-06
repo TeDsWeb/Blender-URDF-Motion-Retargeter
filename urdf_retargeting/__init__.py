@@ -468,102 +468,93 @@ def retarget_frame(scene):
             corrected_current_z - (ref_pos.z - bvh_floor_offset)
         ) * settings.root_scale
 
-        # --- 1.2 DYNAMIC PIVOT CORRECTION ---
-        active_urdf_foot_positions = []
-        current_contact_names = []
+        # --- 1.2 DYNAMIC PIVOT CORRECTION (STICKY + SMOOTHED) ---
+        active_bvh_contacts = []
         for f_name in [settings.foot_l_name, settings.foot_r_name]:
             bvh_bone = bvh.pose.bones.get(f_name)
             if bvh_bone:
-                # Welt-Koordinate des BVH-Fußes prüfen (mit Ihrem Offset-Fix)
                 foot_world_pos = (bvh.matrix_world @ bvh_bone.matrix).to_translation()
-
-                # Prüfung: Hat dieser BVH-Fuß Bodenkontakt?
                 if (foot_world_pos.z - bvh_floor_offset) <= settings.jump_threshold:
-                    # Jetzt alle zugeordneten URDF-Bones aus dem Mapping suchen
-                    current_contact_names = []
-                    for item in settings.mappings:
-                        for u_bone in item.urdf_bones:
-                            if item.bvh_bone_name == f_name:
-                                current_contact_names.append(u_bone.urdf_bone_name)
-                    current_contact_names = sorted(current_contact_names)
+                    active_bvh_contacts.append(f_name)
 
-                    # Positionen dieser URDF-Bones im Weltraum sammeln
-                    for u_name in current_contact_names:
-                        u_bone = urdf.pose.bones.get(u_name)
-                        if u_bone:
-                            u_pos = (urdf.matrix_world @ u_bone.matrix).to_translation()
-                            active_urdf_foot_positions.append(u_pos)
+        last_anchor_name = scene.get("_active_anchor_name", "")
+        anchor_bone_name = ""
 
-        # --- PIVOT & ROTATION BERECHNUNG ---
+        # 1. Sticky Selection
+        if last_anchor_name in active_bvh_contacts:
+            anchor_bone_name = last_anchor_name
+            is_hard_switch = False
+        elif active_bvh_contacts:
+            anchor_bone_name = sorted(active_bvh_contacts)[0]
+            is_hard_switch = True
+        else:
+            anchor_bone_name = ""
+
         pivot_correction = mathutils.Vector((0, 0, 0))
         rotation_correction = mathutils.Quaternion((1, 0, 0, 0))
 
-        if active_urdf_foot_positions:
-            current_urdf_pivot = sum(
-                active_urdf_foot_positions, mathutils.Vector()
-            ) / len(active_urdf_foot_positions)
+        if anchor_bone_name:
+            bvh_anchor_bone = bvh.pose.bones.get(anchor_bone_name)
+            current_bvh_anchor_mat = bvh.matrix_world @ bvh_anchor_bone.matrix
+            current_bvh_anchor_pos = current_bvh_anchor_mat.to_translation()
+            current_bvh_anchor_quat = current_bvh_anchor_mat.to_quaternion()
+            current_rel_pos = bvh_root_mat.inverted() @ current_bvh_anchor_pos
 
-            # Wir nehmen die Rotation des ersten aktiven Fußes als Referenz für die Ausrichtung
-            first_foot_bone = urdf.pose.bones.get(current_contact_names[0])
-            current_foot_quat = (
-                urdf.matrix_world @ first_foot_bone.matrix
-            ).to_quaternion()
-
-            last_anchor_raw = scene.get("_last_urdf_pivot")
-            last_rot_raw = scene.get("_last_urdf_rot")
-            last_contact_key = scene.get("_last_contact_key", "")
-            current_contact_key = ",".join(current_contact_names)
-
-            if (
-                last_anchor_raw is not None
-                and last_rot_raw is not None
-                and last_contact_key == current_contact_key
-            ):
-                # --- TRANSLATION ERROR ---
-                anchor = mathutils.Vector(last_anchor_raw)
-                raw_error = current_urdf_pivot - anchor
-                raw_error.z = 0
-                pivot_correction = raw_error * 0.5  # Dämpfung
-
-                # --- ROTATION ERROR (Z-Achse) ---
-                last_rot = mathutils.Quaternion(last_rot_raw)
-                # Differenz zwischen alter und neuer Rotation
-                rot_diff = current_foot_quat @ last_rot.inverted()
-
-                # Wir isolieren nur die Rotation um die Z-Achse (Yaw), um Umkippen zu vermeiden
-                euler_diff = rot_diff.to_euler()
-                rotation_correction = mathutils.Euler(
-                    (0, 0, euler_diff.z), "XYZ"
-                ).to_quaternion()
+            if is_hard_switch or last_anchor_name == "":
+                # Offset-Transfer (Verhindert Sprung beim Bein-Wechsel)
+                scene["_last_bvh_rel_pos"] = current_rel_pos
+                scene["_last_bvh_anchor_quat"] = current_bvh_anchor_quat
+                # Keine Korrektur im ersten Frame nach Wechsel
+                scene["_last_applied_pivot_corr"] = mathutils.Vector((0, 0, 0))
             else:
-                # RE-PIVOT & RE-ROTATE
-                scene["_last_urdf_pivot"] = current_urdf_pivot
-                scene["_last_urdf_rot"] = current_foot_quat
-                scene["_last_contact_key"] = current_contact_key
+                # --- A. DRIFT BERECHNEN ---
+                last_rel_pos = mathutils.Vector(
+                    scene.get("_last_bvh_rel_pos", current_rel_pos)
+                )
+                raw_drift = (current_rel_pos - last_rel_pos) * settings.root_scale
+
+                # --- B. DÄMPFUNG (TRANSLATION) ---
+                # 0.2 bedeutet: 20% neue Bewegung, 80% Trägheit
+                smoothing_factor = 0.6
+                last_corr = mathutils.Vector(
+                    scene.get("_last_applied_pivot_corr", (0, 0, 0))
+                )
+                pivot_correction = last_corr.lerp(raw_drift, smoothing_factor)
+                pivot_correction.z = 0
+
+                # --- C. ROTATION DRIFT ---
+                last_anchor_quat = mathutils.Quaternion(
+                    scene.get("_last_bvh_anchor_quat", current_bvh_anchor_quat)
+                )
+                rot_drift = current_bvh_anchor_quat @ last_anchor_quat.inverted()
+                rot_drift_quat = mathutils.Euler(
+                    (
+                        -rot_drift.to_euler().x * 0.5,
+                        rot_drift.to_euler().y * 0.5,
+                        -rot_drift.to_euler().z,
+                    ),
+                    "XYZ",
+                ).to_quaternion()
+                rotation_correction = mathutils.Quaternion((1, 0, 0, 0)).slerp(
+                    rot_drift_quat.inverted(), smoothing_factor
+                )
+
+            # Speicher-Updates
+            scene["_active_anchor_name"] = anchor_bone_name
+            scene["_last_bvh_rel_pos"] = current_rel_pos
+            scene["_last_bvh_anchor_quat"] = current_bvh_anchor_quat
+            scene["_last_applied_pivot_corr"] = pivot_correction
         else:
-            scene["_last_urdf_pivot"] = None
-            scene["_last_urdf_rot"] = None
-            scene["_last_contact_key"] = ""
+            scene["_active_anchor_name"] = ""
+            scene["_last_applied_pivot_corr"] = mathutils.Vector((0, 0, 0))
 
-        # --- ANWENDUNG DER KORREKTUR ---
-        # Um den Pivot rotieren (nicht um den Objekt-Ursprung!)
-        # Das ist mathematisch: Verschieben zum Pivot -> Rotieren -> Zurückverschieben
-        # pivot = mathutils.Vector(scene["_last_urdf_pivot"])
+        # --- ANWENDUNG AUF URDF ---
+        # 1. Rotation anwenden (mit Dämpfung gegen Jitter)
+        urdf.rotation_mode = "QUATERNION"
+        urdf.rotation_quaternion = rotation_correction @ urdf.rotation_quaternion
 
-        # # 1. Zum Pivot verschieben
-        # urdf.location -= pivot
-        # # 2. Rotieren (Gegenrotation anwenden)
-        # urdf.rotation_mode = "QUATERNION"
-        # urdf.rotation_quaternion = (
-        #     rotation_correction.inverted() @ urdf.rotation_quaternion
-        # )
-        # urdf.location.rotate(rotation_correction.inverted())
-        # # 3. Zurückverschieben
-        # urdf.location += pivot
-
-        # --- 1.3 POSITIONIERUNG ---
-        # Calculate preliminary target location with scaling
-        target_loc_preliminary = (
+        # 2. Position anwenden
+        target_loc = (
             mathutils.Vector(
                 (
                     (current_bvh_pos.x - ref_pos.x) * settings.root_scale,
@@ -571,18 +562,19 @@ def retarget_frame(scene):
                     delta_z,
                 )
             )
-            # - pivot_correction
+            - pivot_correction
         )
 
         # Set URDF Root Position with Offset
         offset_xy = settings.location_offset
         loc_offset = mathutils.Vector((offset_xy[0], offset_xy[1], 0.0))
-        urdf.location = target_loc_preliminary + loc_offset
+        urdf.location = target_loc + loc_offset
 
         # --- 1.4 ROTATION ---
         ref_rot = mathutils.Quaternion(scene.get("ref_root_rot", current_bvh_rot))
         off_q = mathutils.Euler(settings.rotation_offset).to_quaternion()
         delta_rot = (current_bvh_rot @ ref_rot.inverted()).inverted()
+        delta_rot.x *= -1
         delta_rot.z *= -1
         urdf.rotation_mode = "QUATERNION"
         urdf.rotation_quaternion = off_q @ delta_rot
