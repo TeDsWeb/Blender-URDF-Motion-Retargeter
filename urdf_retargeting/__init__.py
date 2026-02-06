@@ -571,7 +571,7 @@ def retarget_frame(scene):
                     delta_z,
                 )
             )
-            - pivot_correction
+            # - pivot_correction
         )
 
         # Set URDF Root Position with Offset
@@ -583,8 +583,7 @@ def retarget_frame(scene):
         ref_rot = mathutils.Quaternion(scene.get("ref_root_rot", current_bvh_rot))
         off_q = mathutils.Euler(settings.rotation_offset).to_quaternion()
         delta_rot = (current_bvh_rot @ ref_rot.inverted()).inverted()
-        delta_rot.y *= 1
-        delta_rot.z *= 1
+        delta_rot.z *= -1
         urdf.rotation_mode = "QUATERNION"
         urdf.rotation_quaternion = off_q @ delta_rot
 
