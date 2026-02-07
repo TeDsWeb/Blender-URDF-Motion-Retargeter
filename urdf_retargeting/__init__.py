@@ -422,6 +422,7 @@ def get_lowest_z_world(urdf_obj):
     global_min_z = float("inf")
     found_mesh = False
 
+    bpy.context.view_layer.update()
     # Iterate through all objects parented to the rig (links/visuals)
     for child in urdf_obj.children:
         if child.type == "MESH":
@@ -1396,6 +1397,9 @@ class OT_ApplyBVHMapping(Operator):
         urdf_obj = scene.urdf_rig_object
 
         # 1. Reset timeline to start
+        scene.bvh_mapping_settings.live_retarget = (
+            False  # Temporarily disable to avoid interference
+        )
         scene.frame_set(0)
 
         if urdf_obj:
@@ -1425,9 +1429,6 @@ class OT_ApplyBVHMapping(Operator):
 
         # 5. Enable the retargeting handler
         # and set current BVH pose as reference
-        scene.bvh_mapping_settings.live_retarget = (
-            False  # Temporarily disable to avoid interference
-        )
         if settings.bvh_smoothing > 0.0:
             if not self.check_bvh_rotation_mode(bvh_obj):
                 self.report(
@@ -1539,6 +1540,7 @@ class OT_CalibrateRestPose(Operator):
                 scene["bvh_floor_offset"] = lowest_bvh_z
 
             if scene.get("urdf_height_offset", None) is None:
+                print(abs(get_lowest_z_world(urdf)))
                 scene["urdf_height_offset"] = abs(get_lowest_z_world(urdf))
 
         self.report({"INFO"}, f"Calibrated {count} bones. Reference set.")
