@@ -402,6 +402,26 @@ class BVHMappingSettings(PropertyGroup):
         min=0.0,
         max=1.0,
     )
+    knee_l_name: StringProperty(
+        name="Left Knee Bone", description="BVH Bone Name for Left Knee"
+    )
+    knee_r_name: StringProperty(
+        name="Right Knee Bone", description="BVH Bone Name for Right Knee"
+    )
+    knee_retraction_strength: FloatProperty(
+        name="Leg Retraction",
+        description="Wie stark das Knie gebeugt wird, um Bodenkollision zu vermeiden (Gain)",
+        default=5.0,
+        min=0.0,
+        max=20.0,
+    )
+    knee_bending_polarity: FloatProperty(
+        name="Knee Polarity",
+        description="1.0 oder -1.0: In welche Richtung beugt das Knie? (Positiv oder Negativ)",
+        default=1.0,
+        min=-1.0,
+        max=1.0,
+    )
     root_scale: FloatProperty(name="Root Scale", default=1.0)
     location_offset: FloatVectorProperty(
         name="Loc Offset", subtype="TRANSLATION", size=2, default=(0.0, 0.0)
@@ -725,6 +745,92 @@ def retarget_frame(scene):
             urdf_b.rotation_mode = "QUATERNION"
             urdf_b.rotation_quaternion = mathutils.Quaternion((0, 1, 0), final_angle)
 
+    # --- 4.5 SWING LEG RETRACTION (Virtual Leg Shortening) ---
+    # Verhindert, dass das Schwungbein den Boden rammt und den Roboter hochdrückt.
+    # Wir beugen das Knie zusätzlich, wenn der Fuß zu tief ist.
+    bpy.context.view_layer.update()
+    retract_gain = settings.knee_retraction_strength
+
+    if retract_gain > 0.001:
+        bpy.context.view_layer.update()  # Matrizen aktualisieren (Wichtig nach Foot Alignment!)
+
+        # Mapping BVH-Knie -> URDF-Knie vorbereiten
+        bvh_knee_map = {}
+        for item in settings.mappings:
+            if item.bvh_bone_name in [settings.knee_l_name, settings.knee_r_name]:
+                bvh_knee_map[item.bvh_bone_name] = [
+                    b.urdf_bone_name for b in item.urdf_bones
+                ]
+
+        # Wir prüfen beide Füße
+        # Wir definieren Paare: (BVH_Foot, BVH_Knee)
+        leg_pairs = [
+            (settings.foot_l_name, settings.knee_l_name),
+            (settings.foot_r_name, settings.knee_r_name),
+        ]
+
+        floor_z_ref = 0.0  # oder scene.get("bvh_floor_offset", 0.0)
+
+        for bvh_foot, bvh_knee in leg_pairs:
+            # Haben wir ein URDF-Mapping für das Knie dieses Beins?
+            if bvh_knee not in bvh_knee_map:
+                continue
+
+            # Fuß-Höhe prüfen (Wir brauchen das URDF-Gegenstück zum Fuß)
+            # Hier nutzen wir deine bestehende bvh_to_urdf_map Logik oder suchen kurz:
+            urdf_foot_names = []
+            for item in settings.mappings:
+                if item.bvh_bone_name == bvh_foot:
+                    urdf_foot_names = [b.urdf_bone_name for b in item.urdf_bones]
+                    break
+
+            if not urdf_foot_names:
+                continue
+
+            # Wir nehmen den tiefsten Punkt des Fußes
+            min_foot_z = float("inf")
+            for u_f_name in urdf_foot_names:
+                u_foot = urdf.pose.bones.get(u_f_name)
+                if u_foot:
+                    # Welt-Z des Fußes
+                    z = (urdf.matrix_world @ u_foot.matrix).to_translation().z
+                    if z < min_foot_z:
+                        min_foot_z = z
+
+            # Durchdringung berechnen
+            penetration = floor_z_ref - (
+                min_foot_z - scene.get("urdf_foot_height_offset", 0.0)
+            )
+
+            # Wenn wir den Boden berühren/durchdringen (penetration > 0)
+            if penetration > 1e-4:
+
+                # Wir wenden die Korrektur auf alle gemappten Knie-Gelenke an
+                for u_knee_name in bvh_knee_map[bvh_knee]:
+                    u_knee = urdf.pose.bones.get(u_knee_name)
+                    if not u_knee:
+                        continue
+
+                    # KORREKTUR BERECHNEN:
+                    # Einfacher P-Regler: Je tiefer wir sind, desto mehr beugen wir.
+                    # Gain bestimmt wie aggressiv das Bein eingezogen wird.
+                    bend_correction = (
+                        penetration * retract_gain * settings.knee_bending_polarity
+                    )
+
+                    # Wir addieren das auf die Y-Achse (Pitch) des Kniegelenks
+                    # (Annahme: Knie ist ein Revolute Joint um Y)
+                    correction_quat = mathutils.Quaternion((0, 1, 0), bend_correction)
+
+                    u_knee.rotation_quaternion = (
+                        u_knee.rotation_quaternion @ correction_quat
+                    )
+
+                    # Wichtig: Den gespeicherten Export-Winkel updaten!
+                    # Damit BeyondMimic die korrigierten Daten bekommt.
+                    current_euler = u_knee.rotation_quaternion.to_euler("XYZ")
+                    u_knee["_joint_angle"] = current_euler.y
+
     # --- 4. DYNAMIC FOOT ALIGNMENT ---
     # Ziel: Füße in Bodennähe parallel ausrichten, um 'Toe-Digging' beim Export zu verhindern.
     # 1. Update der Szenen-Matrizen, da wir oben gerade Bones rotiert haben
@@ -777,7 +883,9 @@ def retarget_frame(scene):
                     foot_pos = foot_mat_world.to_translation()
 
                     # Distanz zum Boden
-                    dist_to_floor = foot_pos.z - floor_z
+                    dist_to_floor = (
+                        foot_pos.z - scene.get("urdf_foot_height_offset", 0.0)
+                    ) - floor_z
 
                     # B. Nur eingreifen, wenn wir nah am Boden sind
                     if dist_to_floor < flatten_height:
@@ -1173,6 +1281,23 @@ class PANEL_BVHMapping(Panel):
             "bones",
             text="Right Foot",
         )
+        box.prop_search(
+            settings,
+            "knee_l_name",
+            context.scene.bvh_rig_object.pose,
+            "bones",
+            text="L Knee (BVH)",
+        )
+        box.prop_search(
+            settings,
+            "knee_r_name",
+            context.scene.bvh_rig_object.pose,
+            "bones",
+            text="R Knee (BVH)",
+        )
+        row = box.row()
+        row.prop(settings, "knee_retraction_strength", text="Retract Gain")
+        row.prop(settings, "knee_bending_polarity", text="Polarity")
         box.prop(settings, "jump_threshold")
         box.prop(settings, "foot_flattening_height")
         box.prop(settings, "foot_flattening_strength")
@@ -1449,10 +1574,34 @@ class OT_ApplyBVHMapping(Operator):
         bpy.ops.object.calibrate_rest_pose()  # Sets reference pose on smmoothed BVH
         scene.bvh_mapping_settings.live_retarget = True
 
+        if scene.get("urdf_foot_height_offset", None) is not None:
+            del scene[
+                "urdf_foot_height_offset"
+            ]  # Clear cached foot height offset to recalculate with new pose
+
         # 6. Burn in frame 0 to ensure all calculations are up to date
         for _ in range(100):
             scene.frame_set(0)
             context.view_layer.update()
+
+        urdf_foot_names = []
+        for item in settings.mappings:
+            if item.bvh_bone_name in [settings.foot_l_name, settings.foot_r_name]:
+                urdf_foot_names = [b.urdf_bone_name for b in item.urdf_bones]
+                break
+        min_foot_z = float("inf")
+        self.report(
+            {"INFO"},
+            f"Calculating foot height offset using URDF foot bones: {urdf_foot_names}",
+        )
+        for u_f_name in urdf_foot_names:
+            u_foot = urdf_obj.pose.bones.get(u_f_name)
+            if u_foot:
+                # Welt-Z des Fußes
+                z = (urdf_obj.matrix_world @ u_foot.matrix).to_translation().z
+                if z < min_foot_z:
+                    min_foot_z = z
+        scene["urdf_foot_height_offset"] = min_foot_z
 
         self.report({"INFO"}, "Rig reset to frame 0. Retargeting active.")
         return {"FINISHED"}
