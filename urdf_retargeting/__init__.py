@@ -352,6 +352,7 @@ class BVHMappingBone(PropertyGroup):
         items=[("X", "X", ""), ("Y", "Y", ""), ("Z", "Z", "")], default="X"
     )
     sign: EnumProperty(items=[("POS", "+", ""), ("NEG", "-", "")], default="NEG")
+    invert_alignment: BoolProperty(name="Invert Alignment", default=False)
     neutral_offset: FloatProperty(name="Neutral Offset", subtype="ANGLE")
 
 
@@ -831,132 +832,133 @@ def retarget_frame(scene):
                     current_euler = u_knee.rotation_quaternion.to_euler("XYZ")
                     u_knee["_joint_angle"] = current_euler.y
 
-    # --- 4. DYNAMIC FOOT ALIGNMENT ---
-    # Ziel: Füße in Bodennähe parallel ausrichten, um 'Toe-Digging' beim Export zu verhindern.
-    # 1. Update der Szenen-Matrizen, da wir oben gerade Bones rotiert haben
+    # --- 4. DYNAMIC FOOT ALIGNMENT (Vektor-basiert & Parent-Aware) ---
+    # Ziel: Füße in Bodennähe parallel ausrichten.
+    # Wir nutzen Vektoren statt Euler, um "Gimbal Lock" und Drift zu vermeiden.
+
     bpy.context.view_layer.update()
 
     flatten_str = settings.foot_flattening_strength
     flatten_height = settings.foot_flattening_height
-    floor_z = 0.0
+    # floor_z = 0.0 # Falls du einen Offset hast, hier anpassen
 
     if flatten_str > 0.001:
-        # 2. Lookup-Map erstellen: Welcher BVH-Bone steuert welche URDF-Bones?
-        # Wir brauchen das, weil settings.foot_l/r_name nur den BVH-Namen kennt.
+        # Mapping Lookup erstellen
         bvh_to_urdf_map = {}
         for item in settings.mappings:
             if item.bvh_bone_name in [settings.foot_l_name, settings.foot_r_name]:
-                # Wir sammeln alle URDF Bones, die an diesem BVH Bone hängen
-                urdf_names = [b.urdf_bone_name for b in item.urdf_bones]
-                bvh_to_urdf_map[item.bvh_bone_name] = urdf_names
+                urdf_data = [
+                    (b.urdf_bone_name, b.invert_alignment) for b in item.urdf_bones
+                ]
+                bvh_to_urdf_map[item.bvh_bone_name] = urdf_data
 
-        # 3. Iteration über beide Füße (Links und Rechts)
         for bvh_foot_name in [settings.foot_l_name, settings.foot_r_name]:
-
-            # Haben wir URDF Bones für diesen Fuß gefunden?
             if bvh_foot_name not in bvh_to_urdf_map:
                 continue
 
-            for bvh_foot_name in [settings.foot_l_name, settings.foot_r_name]:
-                if bvh_foot_name not in bvh_to_urdf_map:
+            # Invertierungs-Flag (Wichtig für gespiegelte URDF Beine)
+            # is_left = bvh_foot_name == settings.foot_l_name
+            # invert_polarity = (
+            #     settings.foot_invert_l if is_left else settings.foot_invert_r
+            # )
+
+            for u_name, invert_alignment in bvh_to_urdf_map[bvh_foot_name]:
+                urdf_b = urdf.pose.bones.get(u_name)
+                if not urdf_b:
                     continue
 
-                # Wir iterieren über alle URDF-Knochen, die diesem Fuß zugeordnet sind.
-                # (Meistens ist das der 'Ankle_Pitch' oder ähnlich)
-                for u_name in bvh_to_urdf_map[bvh_foot_name]:
-                    urdf_b = urdf.pose.bones.get(u_name)
-                    if not urdf_b:
+                # Wir unterstützen hier nur Revolute/Continuous Joints (meistens Y-Achse)
+                jtype = urdf_b.get("joint_type", "revolute")
+                if jtype not in {"revolute", "continuous"}:
+                    continue
+
+                # --- A. HÖHE PRÜFEN ---
+                foot_mat_world = urdf.matrix_world @ urdf_b.matrix
+                foot_pos = foot_mat_world.to_translation()
+
+                # Distanz unter Berücksichtigung des berechneten Offsets
+                dist_to_floor = foot_pos.z - scene.get("urdf_foot_height_offset", 0.0)
+
+                if dist_to_floor < flatten_height:
+                    influence = (1.0 - (dist_to_floor / flatten_height)) * flatten_str
+                    if influence <= 0.001:
                         continue
 
-                    # JOINT TYPE AWARENESS:
-                    # Handle different logic for revolute (rotation) vs prismatic (translation) joints
-                    jtype = urdf_b.get("joint_type", "revolute")
+                    # --- B. ZIEL-ROTATION IM WELTRAUM (VEKTOR-BASIERT) ---
+                    # 1. Wir holen die "Vorwärts"-Richtung des Fußes im Weltraum.
+                    #    Bei URDF ist die Knochen-Längsachse meistens Y.
+                    forward_vec_world = foot_mat_world.to_3x3() @ mathutils.Vector(
+                        (0, 1, 0)
+                    )
 
-                    # Only revolute and continuous joints are supported in this retargeting engine
-                    if jtype not in {"revolute", "continuous"}:
-                        continue
+                    # 2. Wir projizieren diesen Vektor auf den flachen Boden (Z = 0)
+                    forward_vec_world.z = 0.0
 
-                    # A. Aktuelle Welt-Transformation und Höhe prüfen
-                    # Wir nehmen den Tail des Bones, da dieser oft die Sohle repräsentiert,
-                    # oder Head, je nach Rigging. Hier nehmen wir die Translation der Matrix (Head).
-                    foot_mat_world = urdf.matrix_world @ urdf_b.matrix
-                    foot_pos = foot_mat_world.to_translation()
+                    # Safety Check: Falls der Fuß kerzengerade nach oben zeigt
+                    if forward_vec_world.length < 0.001:
+                        forward_vec_world = mathutils.Vector((0, 1, 0))  # Fallback
+                    else:
+                        forward_vec_world.normalize()
 
-                    # Distanz zum Boden
-                    dist_to_floor = (
-                        foot_pos.z - scene.get("urdf_foot_height_offset", 0.0)
-                    ) - floor_z
+                    # 3. Ziel-Quaternion erstellen:
+                    #    "Zeige mit deiner lokalen Y-Achse in Richtung forward_vec_world,
+                    #     aber richte deine Z-Achse an der Welt-Z-Achse (oben) aus."
+                    #    Das garantiert: Fuß ist flach, behält aber seine Gier-Richtung (Yaw).
+                    target_world_q = forward_vec_world.to_track_quat("Y", "Z")
 
-                    # B. Nur eingreifen, wenn wir nah am Boden sind
-                    if dist_to_floor < flatten_height:
+                    # --- C. TRANSFORMATION IN DEN LOKALEN RAUM ---
+                    # Hier berücksichtigen wir die Schräglage des Parents (Schienbein)!
+                    # Local_Target = Parent_World_Inverse @ World_Target
 
-                        # C. Blend-Faktor berechnen (Linear)
-                        ratio = 1.0 - (dist_to_floor / flatten_height)
-                        influence = max(0.0, min(1.0, ratio)) * flatten_str
-
-                        if influence <= 0.001:
-                            continue
-
-                        # D. Ziel-Berechnung: "Wie müsste ich stehen, um flach zu sein?"
-                        # 1. Aktuelle Orientierung
-                        current_world_quat = foot_mat_world.to_quaternion()
-
-                        # 2. Wunsch-Orientierung (Welt):
-                        # Pitch/Roll genullt (parallel zu XY), Yaw (Z) beibehalten.
-                        current_world_euler = current_world_quat.to_euler("XYZ")
-                        flat_world_quat = mathutils.Euler(
-                            (0, 0, current_world_euler.z), "XYZ"
+                    if urdf_b.parent:
+                        parent_world_mat = urdf.matrix_world @ urdf_b.parent.matrix
+                        target_local_q = (
+                            parent_world_mat.inverted()
+                            @ target_world_q.to_matrix().to_4x4()
+                        ).to_quaternion()
+                    else:
+                        target_local_q = (
+                            urdf.matrix_world.inverted()
+                            @ target_world_q.to_matrix().to_4x4()
                         ).to_quaternion()
 
-                        # 4. Differenz in den LOKALEN Raum des Knochens transformieren
-                        # Wir projizieren die Welt-Differenz auf das lokale Koordinatensystem des Bones.
-                        # Da Rotationen sich addieren, ist die lokale Differenz ungefähr gleich der Welt-Differenz,
-                        # aber wir müssen die Achsen beachten.
-                        # Einfacherer Weg: Wir rechnen alles in Local Space um.
+                    # 1. Aktuelle Ausrichtung des Fußes in der Welt
+                    current_foot_mat = urdf.matrix_world @ urdf_b.matrix
+                    current_foot_q = current_foot_mat.to_quaternion()
 
-                        if urdf_b.parent:
-                            parent_world = urdf.matrix_world @ urdf_b.parent.matrix
-                            # Inverse Parent * Target World = Target Local
-                            target_local_mat = (
-                                parent_world.inverted()
-                                @ flat_world_quat.to_matrix().to_4x4()
-                            )
-                            target_local_quat = target_local_mat.to_quaternion()
-                        else:
-                            target_local_quat = (
-                                urdf.matrix_world.inverted()
-                                @ flat_world_quat.to_matrix().to_4x4()
-                            ).to_quaternion()
+                    # 2. Wir wollen, dass die lokale Z-Achse des Fußes (meist "Oben")
+                    #    exakt mit der Welt-Z-Achse (0,0,1) übereinstimmt.
+                    #    Dazu ermitteln wir den Vektor, der den Fuß "geradezieht".
+                    actual_up = current_foot_q @ mathutils.Vector((0, 0, 1))
+                    target_up = mathutils.Vector((0, 0, 1))
 
-                        # Aktuelle lokale Rotation
-                        current_local_quat = urdf_b.rotation_quaternion
+                    # Wir berechnen die Rotation, die 'actual_up' zu 'target_up' macht
+                    # Das ist der Fehler, den wir korrigieren wollen
+                    error_q = actual_up.rotation_difference(target_up)
 
-                        # Die nötige relative Rotation von Local -> Target Local
-                        rel_quat = current_local_quat.inverted() @ target_local_quat
+                    # 3. Diesen Welt-Fehler transformieren wir in den lokalen Raum des Knochens
+                    # Wir nutzen die Welt-Rotation des Knochens selbst als Basis
+                    local_error_q = current_foot_q.inverted() @ (
+                        error_q @ current_foot_q
+                    )
 
-                        # E. CONSTRAINT: Nur Y-Achse verwenden!
-                        # Wir zerlegen die relative Rotation in Euler-Winkel.
-                        # Da wir im Local Space sind, entspricht rel_euler.y genau der Drehung um die Knochen-Achse.
-                        rel_euler = rel_quat.to_euler("XYZ")
+                    # 4. Nur die relevante Achse (Y-Achse für Roll) extrahieren
+                    # Wir nutzen die Swing-Twist Dekomposition oder einfache Projektion
+                    twist_axis = mathutils.Vector((0, 1, 0))
+                    # Winkel extrahieren (Einfache Methode für kleine Korrekturen)
+                    angle_needed = local_error_q.to_euler("YXZ").y
 
-                        # Wir ignorieren x und z (Pitch/Roll constraints des Gelenks)
-                        # Wir nehmen nur y (Revolute Joint Axis)
-                        delta_y = rel_euler.y * influence
+                    # 5. Polarität und Influence
+                    if invert_alignment:
+                        angle_needed *= -1.0
 
-                        current_angle = urdf_b["_joint_angle"]
-                        final_angle = current_angle + delta_y
-                        # JOINT LIMITS:
-                        # Ensure the angle does not exceed the mechanical limits defined in the URDF.
-                        if jtype != "continuous":
-                            l_min = urdf_b.get("limit_lower", -3.14)
-                            l_max = urdf_b.get("limit_upper", 3.14)
-                            final_angle = max(min(final_angle, l_max), l_min)
-
-                        urdf_b.rotation_mode = "QUATERNION"
-                        urdf_b.rotation_quaternion = mathutils.Quaternion(
-                            (0, 1, 0), final_angle
-                        )
-                        urdf_b["_joint_angle"] = final_angle
+                    # Wende nur das Delta an
+                    correction_quat = mathutils.Quaternion(
+                        twist_axis, angle_needed * influence
+                    )
+                    urdf_b.rotation_quaternion = (
+                        urdf_b.rotation_quaternion @ correction_quat
+                    )
 
         # --- 5. ANTI-SINKING CHECK (Globales Grounding) ---
         bpy.context.view_layer.update()  # Important: Blender needs to update matrices
@@ -1227,6 +1229,7 @@ class UL_URDFBoneList(UIList):
 
         row.prop(item, "source_axis", text="")
         row.prop(item, "sign", text="")
+        row.prop(item, "invert_alignment", text="")
         row.prop(item, "neutral_offset", text="")
 
 
