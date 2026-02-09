@@ -83,8 +83,10 @@ def apply_root_motion_correction(
     pivot_correction = mathutils.Vector((0, 0, 0))
     rotation_correction = mathutils.Quaternion((1, 0, 0, 0))
 
-    # Get BVH root position and rotation
+    # Get BVH root position and rotation (with optional position offset for grounding)
     bvh_root_mat = bvh_obj.matrix_world @ bvh_obj.pose.bones[0].matrix
+    bvh_offset = mathutils.Vector(settings.bvh_position_offset)
+    bvh_root_mat.translation += bvh_offset
     bvh_floor_offset = scene.get("bvh_floor_offset", 0.0)
 
     # Identify which feet are in contact (sticky anchor selection)
@@ -420,9 +422,10 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     urdf.rotation_mode = "QUATERNION"
     urdf.rotation_quaternion = rotation_correction @ urdf.rotation_quaternion
 
-    # Get reference position for Z-axis handling
+    # Get reference position for Z-axis handling (with BVH position offset for grounding)
     bvh_root_mat = bvh.matrix_world @ bvh.pose.bones[0].matrix
-    current_bvh_pos = bvh_root_mat.to_translation()
+    bvh_offset = mathutils.Vector(settings.bvh_position_offset)
+    current_bvh_pos = bvh_root_mat.to_translation() + bvh_offset
     ref_pos = mathutils.Vector(scene.get("ref_root_pos", current_bvh_pos))
     bvh_floor_offset = scene.get("bvh_floor_offset", 0.0)
 

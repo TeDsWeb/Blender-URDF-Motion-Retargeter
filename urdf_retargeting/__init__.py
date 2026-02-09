@@ -34,13 +34,22 @@ from bpy.props import PointerProperty
 
 # Import modules and register classes
 from .data_structures import BVHMappingBone, BVHMappingItem, BVHMappingSettings
-from .ui import UL_BVHMappingList, UL_URDFBoneList, PANEL_BVHMapping
+from .ui import (
+    UL_BVHMappingList,
+    UL_URDFBoneList,
+    PANEL_RigSelection,
+    PANEL_MotionOptions,
+    PANEL_FootConfiguration,
+    PANEL_BoneMapping,
+    PANEL_ApplyAndExport,
+)
 from .operators import (
     OT_GenerateMappingList,
     OT_ApplyBVHMapping,
     OT_CalibrateRestPose,
     OT_AddBVHBone,
     OT_RemoveBVHBone,
+    OT_ClearScene,
     IMPORT_OT_urdf_humanoid,
     menu_func_import,
 )
@@ -57,13 +66,18 @@ classes = [
     # UI
     UL_BVHMappingList,
     UL_URDFBoneList,
-    PANEL_BVHMapping,
+    PANEL_RigSelection,
+    PANEL_MotionOptions,
+    PANEL_FootConfiguration,
+    PANEL_BoneMapping,
+    PANEL_ApplyAndExport,
     # Operators
     OT_GenerateMappingList,
     OT_ApplyBVHMapping,
     OT_CalibrateRestPose,
     OT_AddBVHBone,
     OT_RemoveBVHBone,
+    OT_ClearScene,
     IMPORT_OT_urdf_humanoid,
     OT_ExportBeyondMimic,
 ]

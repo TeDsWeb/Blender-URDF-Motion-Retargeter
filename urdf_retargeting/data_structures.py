@@ -145,16 +145,23 @@ class BVHMappingSettings(PropertyGroup):
         default=1.0,
     )
     location_offset: FloatVectorProperty(
-        name="Loc Offset",
+        name="URDF Pos Offset",
         description="Manual offset to root position (XY plane)",
         subtype="TRANSLATION",
         size=2,
         default=(0.0, 0.0),
     )
     rotation_offset: FloatVectorProperty(
-        name="Rot Offset",
+        name="URDF Rot Offset",
         description="Manual offset to root rotation (Euler angles)",
         subtype="EULER",
+        default=(0.0, 0.0, 0.0),
+    )
+    bvh_position_offset: FloatVectorProperty(
+        name="BVH Pos Offset",
+        description="Manual offset to BVH rig position for grounding (XYZ)",
+        subtype="TRANSLATION",
+        size=3,
         default=(0.0, 0.0, 0.0),
     )
 

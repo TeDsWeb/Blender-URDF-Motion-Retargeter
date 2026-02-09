@@ -1,8 +1,8 @@
 """
 User interface panels and lists for BVH-to-URDF retargeting.
 
-Provides the main settings panel, bone mapping lists, and property drawings
-for the Blender addon UI.
+Provides multiple organized panels and lists for bone mapping configuration,
+motion options, and export parameters.
 """
 
 from bpy.types import Panel, UIList
@@ -76,11 +76,103 @@ class UL_URDFBoneList(UIList):
         row.prop(item, "neutral_offset", text="")
 
 
-class PANEL_BVHMapping(Panel):
-    """Main panel for BVH-to-URDF retargeting configuration."""
+class PANEL_RigSelection(Panel):
+    """Panel for selecting URDF and BVH rigs."""
 
-    bl_label = "URDF Robot Retargeting"
-    bl_idname = "VIEW3D_PT_urdf_mapping"
+    bl_label = "Rig Selection"
+    bl_idname = "VIEW3D_PT_urdf_rig_selection"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "BVH → URDF Retargeting"
+
+    def draw(self, context):
+        """Draw rig selection panel."""
+        layout = self.layout
+        s = context.scene
+
+        layout.prop(s, "urdf_rig_object", text="URDF Rig")
+        layout.prop(s, "bvh_rig_object", text="BVH Rig")
+
+
+class PANEL_MotionOptions(Panel):
+    """Panel for root motion and smoothing options."""
+
+    bl_label = "Motion Options"
+    bl_idname = "VIEW3D_PT_urdf_motion_options"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "BVH → URDF Retargeting"
+
+    def draw(self, context):
+        """Draw motion options panel."""
+        layout = self.layout
+        settings = context.scene.bvh_mapping_settings
+
+        # Root motion control
+        box = layout.box()
+        box.label(text="Root Motion", icon="ARMATURE_DATA")
+        box.prop(settings, "root_scale")
+        box.prop(settings, "location_offset")
+        box.prop(settings, "rotation_offset")
+        box.prop(settings, "bvh_position_offset")
+
+        # Motion smoothing
+        box = layout.box()
+        box.label(text="Smoothing", icon="MOD_SMOOTH")
+        box.prop(settings, "bvh_smoothing")
+        box.prop(settings, "joint_smoothing")
+
+
+class PANEL_FootConfiguration(Panel):
+    """Panel for foot configuration and ground contact parameters."""
+
+    bl_label = "Foot Configuration"
+    bl_idname = "VIEW3D_PT_urdf_foot_config"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "BVH → URDF Retargeting"
+
+    def draw(self, context):
+        """Draw foot configuration panel."""
+        layout = self.layout
+        s = context.scene
+        settings = s.bvh_mapping_settings
+
+        if not s.bvh_rig_object:
+            layout.label(text="Select BVH Rig first", icon="INFO")
+            return
+
+        # Foot bone selection
+        box = layout.box()
+        box.label(text="Foot Bones", icon="BONE_DATA")
+        box.prop_search(
+            settings,
+            "foot_l_name",
+            s.bvh_rig_object.pose,
+            "bones",
+            text="Left Foot",
+        )
+        box.prop_search(
+            settings,
+            "foot_r_name",
+            s.bvh_rig_object.pose,
+            "bones",
+            text="Right Foot",
+        )
+
+        # Foot contact parameters
+        box = layout.box()
+        box.label(text="Foot Contact", icon="SNAP_FACE_CENTER")
+        box.prop(settings, "jump_threshold")
+        box.prop(settings, "foot_flattening_height")
+        box.prop(settings, "foot_flattening_strength")
+
+
+class PANEL_BoneMapping(Panel):
+    """Panel for BVH-to-URDF bone mapping management."""
+
+    bl_label = "Bone Mapping"
+    bl_idname = "VIEW3D_PT_urdf_bone_mapping"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "BVH → URDF Retargeting"
@@ -112,48 +204,12 @@ class PANEL_BVHMapping(Panel):
         return duplicates, used_urdf_bones
 
     def draw(self, context):
-        """Draw the retargeting panel."""
+        """Draw bone mapping panel."""
         layout = self.layout
-        s = context.scene
-        settings = s.bvh_mapping_settings
+        settings = context.scene.bvh_mapping_settings
 
-        # Rig selection
-        layout.prop(s, "urdf_rig_object")
-        layout.prop(s, "bvh_rig_object")
-
-        # Retargeting options
-        box = layout.box()
-        box.label(text="BVH → URDF Options")
-        box.prop(settings, "root_scale")
-        box.prop(settings, "location_offset")
-        box.prop(settings, "rotation_offset")
-
-        # Foot configuration
-        if s.bvh_rig_object:
-            box.prop_search(
-                settings,
-                "foot_l_name",
-                s.bvh_rig_object.pose,
-                "bones",
-                text="Left Foot",
-            )
-            box.prop_search(
-                settings,
-                "foot_r_name",
-                s.bvh_rig_object.pose,
-                "bones",
-                text="Right Foot",
-            )
-
-        # Foot and movement parameters
-        box.prop(settings, "jump_threshold")
-        box.prop(settings, "foot_flattening_height")
-        box.prop(settings, "foot_flattening_strength")
-        box.prop(settings, "bvh_smoothing")
-        box.prop(settings, "joint_smoothing")
-
-        # Generate mappings
-        layout.operator("object.generate_mapping_list")
+        # Generate mappings button
+        layout.operator("object.generate_mapping_list", text="Generate Mapping List")
 
         if not settings.mappings:
             layout.label(
@@ -204,12 +260,39 @@ class PANEL_BVHMapping(Panel):
                     text=f"Joint '{d}' is controlled multiple times", icon="BONE_DATA"
                 )
 
+
+class PANEL_ApplyAndExport(Panel):
+    """Panel for applying mappings and exporting data."""
+
+    bl_label = "Actions"
+    bl_idname = "VIEW3D_PT_urdf_actions"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "BVH → URDF Retargeting"
+
+    def draw(self, context):
+        """Draw actions panel."""
+        layout = self.layout
+        settings = context.scene.bvh_mapping_settings
+
         # Apply mapping
-        layout.operator("object.apply_bvh_mapping")
+        box = layout.box()
+        box.label(text="Retargeting", icon="PLAY")
+        box.operator("object.apply_bvh_mapping", text="Apply Mapping")
 
         # Export section
-        layout.separator()
         box = layout.box()
-        box.label(text="Export Beyond Mimic", icon="EXPORT")
-        box.prop(settings, "target_hz")
-        box.operator("object.export_beyond_mimic", text="Export")
+        box.label(text="Export", icon="EXPORT")
+        box.prop(settings, "target_hz", text="Export Hz")
+        box.operator("object.export_beyond_mimic", text="Export to Beyond Mimic")
+
+        # Danger: Clear scene
+        box = layout.box()
+        box.label(text="Danger Zone", icon="ERROR")
+        row = box.row()
+        row.alert = True
+        row.operator(
+            "object.clear_retarget_scene",
+            text="Clear Scene (Delete Rigs & Clear Caches)",
+            icon="TRASH",
+        )

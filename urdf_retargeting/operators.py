@@ -216,6 +216,17 @@ class OT_ApplyBVHMapping(Operator):
         scene.bvh_mapping_settings.live_retarget = False
         scene.frame_set(0)
 
+        # Clear only per-frame transient state keys (not calibration keys)
+        for _k in (
+            "_last_bvh_rel_pos",
+            "_last_bvh_anchor_quat",
+            "_last_applied_pivot_corr",
+            "_active_anchor_name",
+            "_bvh_smooth_cache",
+        ):
+            if _k in scene:
+                del scene[_k]
+
         # Reset URDF bones to neutral pose
         for pb in urdf_obj.pose.bones:
             pb.rotation_mode = "QUATERNION"
@@ -226,14 +237,18 @@ class OT_ApplyBVHMapping(Operator):
 
             pb.rotation_quaternion = mathutils.Quaternion((0, 1, 0), neutral)
 
-            # Clear caches
-            for key in ("offset", "_joint_angle", "_last_urdf_angle"):
+            # Clear per-frame caches (not joint limits or joint type which are static)
+            for key in (
+                "offset",
+                "_joint_angle",
+                "_last_urdf_angle",
+                "is_velocity_limited",
+            ):
                 if key in pb:
                     del pb[key]
 
-        # Clear global smoothing cache
-        if "_bvh_smooth_cache" in scene:
-            scene["_bvh_smooth_cache"] = {}
+        # Reinitialize global smoothing cache
+        scene["_bvh_smooth_cache"] = {}
 
         # Apply zero-lag smoothing if enabled
         if settings.bvh_smoothing > 0.0:
@@ -254,25 +269,8 @@ class OT_ApplyBVHMapping(Operator):
         else:
             scene.smoothed_bvh_rig_object = bvh_obj
 
-        # Calibrate reference poses
+        # Calibrate reference poses (sets ref_root_pos, ref_root_rot, bvh_floor_offset, urdf_height_offset)
         bpy.ops.object.calibrate_rest_pose()
-
-        # Calculate foot height offset
-        urdf_foot_names = []
-        for item in settings.mappings:
-            if item.bvh_bone_name in [settings.foot_l_name, settings.foot_r_name]:
-                urdf_foot_names = [b.urdf_bone_name for b in item.urdf_bones]
-                break
-
-        min_foot_z = float("inf")
-        for u_f_name in urdf_foot_names:
-            u_foot = urdf_obj.pose.bones.get(u_f_name)
-            if u_foot:
-                z = (urdf_obj.matrix_world @ u_foot.matrix).to_translation().z
-                if z < min_foot_z:
-                    min_foot_z = z
-
-        scene["urdf_foot_height_offset"] = min_foot_z
 
         # Enable retargeting
         scene.bvh_mapping_settings.live_retarget = True
@@ -281,6 +279,33 @@ class OT_ApplyBVHMapping(Operator):
         for _ in range(100):
             scene.frame_set(0)
             context.view_layer.update()
+
+        # Calculate foot height offset from current URDF foot position
+        # Find foot bone names from mappings
+        urdf_foot_names = []
+        for item in settings.mappings:
+            if item.bvh_bone_name in [settings.foot_l_name, settings.foot_r_name]:
+                urdf_foot_names.extend([b.urdf_bone_name for b in item.urdf_bones])
+
+        # Compute minimum Z of all foot bones
+        min_foot_z = float("inf")
+        if urdf_foot_names:
+            bpy.context.view_layer.update()
+            for u_f_name in urdf_foot_names:
+                u_foot = urdf_obj.pose.bones.get(u_f_name)
+                if u_foot:
+                    z = (urdf_obj.matrix_world @ u_foot.matrix).to_translation().z
+                    if z < min_foot_z:
+                        min_foot_z = z
+
+        # Set foot height offset, with fallback to 0 if feet are not found
+        if min_foot_z == float("inf"):
+            min_foot_z = 0.0
+            self.report(
+                {"WARNING"}, "No foot bones found; using foot height offset 0.0"
+            )
+
+        scene["urdf_foot_height_offset"] = min_foot_z
 
         self.report({"INFO"}, "Rig reset to frame 0. Retargeting active.")
         return {"FINISHED"}
@@ -317,7 +342,7 @@ class OT_CalibrateRestPose(Operator):
                 item.ref_rot = bvh_bone.matrix_basis.to_quaternion()
                 count += 1
 
-        # Calculate BVH and URDF floor offsets
+        # Calculate BVH and URDF floor offsets (always recalculate, don't check if None)
         if (
             settings.foot_l_name in bvh.pose.bones
             and settings.foot_r_name in bvh.pose.bones
@@ -332,9 +357,12 @@ class OT_CalibrateRestPose(Operator):
             )
             if scene.get("bvh_floor_offset", None) is None:
                 scene["bvh_floor_offset"] = lowest_bvh_z
-
             if scene.get("urdf_height_offset", None) is None:
                 scene["urdf_height_offset"] = abs(get_lowest_z_world(urdf))
+        else:
+            # Warning if foot bones are not found
+            self.report({"Error"}, "Foot bones not found for floor offset calculation")
+            return {"CANCELLED"}
 
         self.report({"INFO"}, f"Calibrated {count} bones. Reference set.")
         return {"FINISHED"}
@@ -411,3 +439,148 @@ def menu_func_import(self, context):
     self.layout.operator(
         IMPORT_OT_urdf_humanoid.bl_idname, text="URDF Humanoid (.urdf)"
     )
+
+
+class OT_ClearScene(Operator):
+    """Delete addon-created rigs and clear runtime caches (confirm required)."""
+
+    bl_idname = "object.clear_retarget_scene"
+    bl_label = "Clear Scene (Delete Addon Objects & Caches)"
+    bl_description = "Remove only objects created by this addon and clear related caches (irreversible)"
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        scene = context.scene
+
+        # Disable live retargeting if present
+        try:
+            scene.bvh_mapping_settings.live_retarget = False
+        except Exception:
+            pass
+
+        # Helper: check if object is safe to delete (addon-owned)
+        def is_addon_object(obj):
+            """
+            Return True only if object has both:
+            - An addon-specific property marker (_link_to_bone, urdf_joint_order)
+            - AND an addon naming pattern (_smoothed, _mesh_, _Rig)
+            """
+            has_addon_prop = (
+                obj.get("_link_to_bone") is not None
+                or obj.get("urdf_joint_order") is not None
+            )
+            has_addon_name = (
+                obj.name.endswith("_smoothed")
+                or "_mesh_" in obj.name
+                or obj.name.endswith("_Rig")
+            )
+            return has_addon_prop and has_addon_name
+
+        # Collect scene-referenced rigs (these are always addon-owned)
+        scene_ref_objs = set()
+        for key in ("smoothed_bvh_rig_object", "bvh_rig_object", "urdf_rig_object"):
+            obj = scene.get(key)
+            if obj and isinstance(obj, bpy.types.Object):
+                scene_ref_objs.add(obj.name)
+
+        to_delete = set()
+
+        # Add scene-referenced rigs
+        to_delete.update(scene_ref_objs)
+
+        # Add objects that pass the strict addon check
+        for obj in bpy.data.objects:
+            if is_addon_object(obj):
+                to_delete.add(obj.name)
+
+        # Include children of addon objects
+        for obj in list(bpy.data.objects):
+            if obj.parent and obj.parent.name in to_delete:
+                to_delete.add(obj.name)
+
+        removed = []
+        # Delete collected addon objects only
+        for name in list(to_delete):
+            if name in bpy.data.objects:
+                obj = bpy.data.objects[name]
+                # Remove action if strictly linked to this object
+                if obj.animation_data and obj.animation_data.action:
+                    act = obj.animation_data.action
+                    try:
+                        bpy.data.actions.remove(act, do_unlink=True)
+                    except Exception:
+                        pass
+                try:
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                    removed.append(name)
+                except Exception:
+                    pass
+
+        # Clean orphan datablocks that may have been created by addon
+        for mesh in list(bpy.data.meshes):
+            if mesh.users == 0:
+                try:
+                    bpy.data.meshes.remove(mesh, do_unlink=True)
+                except Exception:
+                    pass
+        for arm in list(bpy.data.armatures):
+            if arm.users == 0:
+                try:
+                    bpy.data.armatures.remove(arm, do_unlink=True)
+                except Exception:
+                    pass
+        for mat in list(bpy.data.materials):
+            if mat.users == 0:
+                try:
+                    bpy.data.materials.remove(mat, do_unlink=True)
+                except Exception:
+                    pass
+        for act in list(bpy.data.actions):
+            if act.users == 0:
+                try:
+                    bpy.data.actions.remove(act, do_unlink=True)
+                except Exception:
+                    pass
+
+        # Clear transient scene keys (calibration and runtime)
+        for k in (
+            "_last_bvh_rel_pos",
+            "_last_bvh_anchor_quat",
+            "_last_applied_pivot_corr",
+            "_active_anchor_name",
+            "_bvh_smooth_cache",
+            "urdf_foot_height_offset",
+            "ref_root_pos",
+            "ref_root_rot",
+            "bvh_floor_offset",
+            "urdf_height_offset",
+        ):
+            if k in scene:
+                try:
+                    del scene[k]
+                except Exception:
+                    pass
+
+        # Clear addon-specific object properties from remaining objects
+        for obj in bpy.data.objects:
+            if obj.name in removed:
+                continue
+            for prop in ("_link_to_bone", "urdf_joint_order"):
+                if prop in obj:
+                    try:
+                        del obj[prop]
+                    except Exception:
+                        pass
+
+        # Clear scene pointers
+        for key in ("smoothed_bvh_rig_object", "bvh_rig_object", "urdf_rig_object"):
+            if key in scene:
+                try:
+                    del scene[key]
+                except Exception:
+                    pass
+
+        self.report({"INFO"}, f"Cleared addon objects: {len(removed)}")
+        return {"FINISHED"}
