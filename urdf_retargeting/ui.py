@@ -121,6 +121,7 @@ class PANEL_MotionOptions(Panel):
         box.label(text="Smoothing", icon="MOD_SMOOTH")
         box.prop(settings, "bvh_smoothing")
         box.prop(settings, "joint_smoothing")
+        box.prop(settings, "max_jump_threshold")
 
 
 class PANEL_FootConfiguration(Panel):

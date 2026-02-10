@@ -225,7 +225,9 @@ def apply_joint_retargeting(
         cache_val_key = f"val_{bvh_obj.name}_{urdf_bone_mapping.urdf_bone_name}"
         if cache_val_key in smooth_cache:
             prev_val = smooth_cache[cache_val_key]
-            val = apply_continuity_correction(val, prev_val)
+            val = apply_continuity_correction(
+                val, prev_val, settings.max_jump_threshold
+            )
         smooth_cache[cache_val_key] = val
 
         # Apply velocity limiting
@@ -258,7 +260,6 @@ def apply_joint_retargeting(
 
         # Apply exponential smoothing
         last_angle = get_bone_property(urdf_b, "_last_urdf_angle", target_angle)
-        alpha_joint = 1.0 - settings.joint_smoothing
         final_angle = apply_exponential_smoothing(
             target_angle, last_angle, settings.joint_smoothing
         )
@@ -366,7 +367,9 @@ def apply_foot_alignment(
             cache_val_key = f"align_val_{bvh_obj.name}_{u_name}"
             if cache_val_key in smooth_cache:
                 prev_val = smooth_cache[cache_val_key]
-                val = apply_continuity_correction(val, prev_val)
+                val = apply_continuity_correction(
+                    val, prev_val, settings.max_jump_threshold
+                )
             smooth_cache[cache_val_key] = val
 
             # Blend with current angle and apply limits

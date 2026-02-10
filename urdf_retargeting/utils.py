@@ -75,26 +75,37 @@ def extract_twist_angle(
     return 2.0 * math.atan2(projection, quaternion.w)
 
 
-def apply_continuity_correction(current_value: float, previous_value: float) -> float:
+def apply_continuity_correction(
+    current_value: float, previous_value: float, max_jump: float = 1.5
+) -> float:
     """
     Apply anti-flip correction to prevent discontinuities at ±π boundaries.
 
     When rotations wrap around from +π to -π (or vice versa), this function
     adjusts the current value to maintain smooth continuity with the previous value.
 
+    Also includes a sanity check to reject unrealistic jumps that indicate
+    extraction instability (e.g., from quaternion singularities).
+
     Args:
         current_value: The current angle value (in radians).
         previous_value: The previous angle value (in radians).
+        max_jump: Maximum allowed jump in radians; larger jumps are rejected (default: 1.5 rad ≈ 86°).
 
     Returns:
         The corrected angle that maintains continuity with the previous value.
+        Returns previous_value if a discontinuity larger than max_jump is detected.
     """
     diff = current_value - previous_value
 
     if diff > math.pi:
-        return current_value - 2 * math.pi
+        current_value = current_value - 2 * math.pi
     elif diff < -math.pi:
-        return current_value + 2 * math.pi
+        current_value = current_value + 2 * math.pi
+
+    # Sanity check: reject unrealistic jumps that indicate extraction instability
+    if abs(current_value - previous_value) > max_jump:
+        return previous_value
 
     return current_value
 

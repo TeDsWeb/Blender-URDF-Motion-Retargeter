@@ -103,6 +103,14 @@ class BVHMappingSettings(PropertyGroup):
         min=0.0,
         max=1.0,
     )
+    max_jump_threshold: FloatProperty(
+        name="Max Jump Threshold",
+        description="Maximum allowed angle jump in radians (rejects larger jumps as extraction artifacts)",
+        default=1.5,
+        min=0.1,
+        max=3.14159,
+        subtype="ANGLE",
+    )
 
     # Foot Contact & Anchoring
     foot_l_name: StringProperty(
