@@ -106,8 +106,8 @@ class BVHMappingSettings(PropertyGroup):
     max_jump_threshold: FloatProperty(
         name="Max Jump Threshold",
         description="Maximum allowed angle jump in radians (rejects larger jumps as extraction artifacts)",
-        default=1.5,
-        min=0.1,
+        default=0.1745,
+        min=0.01,
         max=3.14159,
         subtype="ANGLE",
     )
