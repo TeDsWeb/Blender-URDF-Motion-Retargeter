@@ -207,6 +207,10 @@ class OT_ExportBeyondMimic(Operator):
                         "source_fps": scene.render.fps,
                         "source_total_frames": self._total_frames,
                         "export_hz": settings.target_hz,
+                        "export_frame_range": {
+                            "from": self._export_from_frame,
+                            "to": self._export_to_frame,
+                        },
                         "duration_secs": self._duration,
                         "total_samples": len(self._data_rows),
                         # Export Settings
