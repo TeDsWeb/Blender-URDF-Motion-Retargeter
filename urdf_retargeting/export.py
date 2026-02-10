@@ -20,6 +20,18 @@ class OT_ExportBeyondMimic(Operator):
     bl_description = "Select directory; files will be named after the Source BVH rig and resampled to Target Hz"
 
     directory: bpy.props.StringProperty(name="Export Directory", subtype="DIR_PATH")
+    export_from_frame: bpy.props.IntProperty(
+        name="Export From Frame",
+        description="First Blender frame to include in the exported data (inclusive)",
+        default=0,
+        min=0,
+    )
+    export_to_frame: bpy.props.IntProperty(
+        name="Export To Frame",
+        description="Last Blender frame to include in the exported data (inclusive)",
+        default=0,
+        min=0,
+    )
 
     # Internal Modal State
     _timer = None
@@ -54,30 +66,38 @@ class OT_ExportBeyondMimic(Operator):
                 # Set frame with subframe for smooth interpolation
                 scene.frame_set(int(blender_frame), subframe=blender_frame % 1.0)
 
-                # Collect root data (translation + quaternion)
-                row = [
-                    urdf.location.x,
-                    urdf.location.y,
-                    urdf.location.z,
-                    urdf.rotation_quaternion.x,
-                    urdf.rotation_quaternion.y,
-                    urdf.rotation_quaternion.z,
-                    urdf.rotation_quaternion.w,
-                ]
+                # Only append rows that fall within the user-specified export frame range.
+                # We still advance through all samples (so animation is fully evaluated),
+                # but write output only for frames between export_from and export_to.
+                if blender_frame >= getattr(
+                    self, "_export_from_frame", scene.frame_start
+                ) and blender_frame <= getattr(
+                    self, "_export_to_frame", scene.frame_end
+                ):
+                    # Collect root data (translation + quaternion)
+                    row = [
+                        urdf.location.x,
+                        urdf.location.y,
+                        urdf.location.z,
+                        urdf.rotation_quaternion.x,
+                        urdf.rotation_quaternion.y,
+                        urdf.rotation_quaternion.z,
+                        urdf.rotation_quaternion.w,
+                    ]
 
-                # Collect joint angles
-                for j in self._joints:
-                    pb = urdf.pose.bones[j]
-                    row.append(pb.get("_joint_angle", 0.0))
+                    # Collect joint angles
+                    for j in self._joints:
+                        pb = urdf.pose.bones[j]
+                        row.append(pb.get("_joint_angle", 0.0))
 
-                    # Store metadata only once
-                    if self._current_step == 0:
-                        self._meta_joints[j] = {
-                            "lower": pb.get("limit_lower", -3.14),
-                            "upper": pb.get("limit_upper", 3.14),
-                        }
+                        # Store metadata once when we append the first exported sample
+                        if not self._meta_joints:
+                            self._meta_joints[j] = {
+                                "lower": pb.get("limit_lower", -3.14),
+                                "upper": pb.get("limit_upper", 3.14),
+                            }
 
-                self._data_rows.append(row)
+                    self._data_rows.append(row)
 
                 # UI update
                 context.workspace.status_text_set(
@@ -113,6 +133,28 @@ class OT_ExportBeyondMimic(Operator):
         self._num_steps = int(self._duration * target_hz) + 1
         self._time_per_step = 1.0 / target_hz
 
+        # Resolve export frame range (prefer operator props, then UI settings, then scene range)
+        if self.export_from_frame > 0:
+            exp_from = self.export_from_frame
+        elif getattr(settings, "export_from_frame", 0) > 0:
+            exp_from = settings.export_from_frame
+        else:
+            exp_from = scene.frame_start
+
+        if self.export_to_frame > 0:
+            exp_to = self.export_to_frame
+        elif getattr(settings, "export_to_frame", 0) > 0:
+            exp_to = settings.export_to_frame
+        else:
+            exp_to = scene.frame_end
+        # Clamp to scene bounds
+        exp_from = max(scene.frame_start, min(exp_from, scene.frame_end))
+        exp_to = max(scene.frame_start, min(exp_to, scene.frame_end))
+        if exp_from > exp_to:
+            exp_from, exp_to = exp_to, exp_from
+        self._export_from_frame = exp_from
+        self._export_to_frame = exp_to
+
         self._joints = list(urdf.get("urdf_joint_order", []))
         self._current_step = 0
         self._data_rows = []
@@ -121,6 +163,10 @@ class OT_ExportBeyondMimic(Operator):
 
         # Start modal loop
         wm = context.window_manager
+        # Show brief info in the workspace status about the export range
+        context.workspace.status_text_set(
+            f"Exporting frames {self._export_from_frame}..{self._export_to_frame} → {self._base_name} ({settings.target_hz}Hz)"
+        )
         wm.progress_begin(0, self._num_steps)
         self._timer = wm.event_timer_add(0.001, window=context.window)
         wm.modal_handler_add(self)

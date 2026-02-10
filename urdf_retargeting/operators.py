@@ -269,6 +269,19 @@ class OT_ApplyBVHMapping(Operator):
         else:
             scene.smoothed_bvh_rig_object = bvh_obj
 
+        # Initialize export frame range defaults (only in operator context)
+        try:
+            if (
+                getattr(settings, "export_from_frame", 0) == 0
+                and getattr(settings, "export_to_frame", 0) == 0
+                and bvh_obj is not None
+            ):
+                settings.export_from_frame = scene.frame_start
+                settings.export_to_frame = scene.frame_end
+        except Exception:
+            # Defensive: if properties are not present or writing fails, ignore
+            pass
+
         # Calibrate reference poses (sets ref_root_pos, ref_root_rot, bvh_floor_offset, urdf_height_offset)
         bpy.ops.object.calibrate_rest_pose()
 

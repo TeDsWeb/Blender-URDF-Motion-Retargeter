@@ -285,7 +285,16 @@ class PANEL_ApplyAndExport(Panel):
         box = layout.box()
         box.label(text="Export", icon="EXPORT")
         box.prop(settings, "target_hz", text="Export Hz")
-        box.operator("object.export_beyond_mimic", text="Export to Beyond Mimic")
+
+        # Export frame range controls (auto-fill to scene range when BVH rig present)
+        row = box.row(align=True)
+        row.prop(settings, "export_from_frame", text="From")
+        row.prop(settings, "export_to_frame", text="To")
+
+        op = box.operator("object.export_beyond_mimic", text="Export to Beyond Mimic")
+        # pass current UI settings as defaults to the operator so file-browser shows them
+        op.export_from_frame = settings.export_from_frame
+        op.export_to_frame = settings.export_to_frame
 
         # Danger: Clear scene
         box = layout.box()

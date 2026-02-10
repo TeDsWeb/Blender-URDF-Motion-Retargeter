@@ -181,3 +181,15 @@ class BVHMappingSettings(PropertyGroup):
         min=1,
         max=240,
     )
+    export_from_frame: IntProperty(
+        name="Export From Frame",
+        description="First frame to include when exporting (scene frame if 0)",
+        default=0,
+        min=0,
+    )
+    export_to_frame: IntProperty(
+        name="Export To Frame",
+        description="Last frame to include when exporting (scene frame if 0)",
+        default=0,
+        min=0,
+    )
