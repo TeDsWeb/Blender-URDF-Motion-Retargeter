@@ -165,13 +165,6 @@ class BVHMappingSettings(PropertyGroup):
         subtype="EULER",
         default=(0.0, 0.0, 0.0),
     )
-    bvh_position_offset: FloatVectorProperty(
-        name="BVH Pos Offset",
-        description="Manual offset to BVH rig position for grounding (XYZ)",
-        subtype="TRANSLATION",
-        size=3,
-        default=(0.0, 0.0, 0.0),
-    )
 
     # Export
     target_hz: IntProperty(

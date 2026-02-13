@@ -218,10 +218,10 @@ class OT_ApplyBVHMapping(Operator):
 
         # Clear only per-frame transient state keys (not calibration keys)
         for _k in (
-            "_last_bvh_rel_pos",
-            "_last_bvh_anchor_quat",
-            "_last_applied_pivot_corr",
+            "_persistent_foot_correction",
             "_active_anchor_name",
+            "_anchor_world_pos_xy",
+            "_foot_positions",
             "_bvh_smooth_cache",
         ):
             if _k in scene:
@@ -559,10 +559,10 @@ class OT_ClearScene(Operator):
 
         # Clear transient scene keys (calibration and runtime)
         for k in (
-            "_last_bvh_rel_pos",
-            "_last_bvh_anchor_quat",
-            "_last_applied_pivot_corr",
+            "_persistent_foot_correction",
             "_active_anchor_name",
+            "_anchor_world_pos_xy",
+            "_foot_positions",
             "_bvh_smooth_cache",
             "urdf_foot_height_offset",
             "ref_root_pos",

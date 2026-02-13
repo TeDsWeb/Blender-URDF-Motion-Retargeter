@@ -114,7 +114,6 @@ class PANEL_MotionOptions(Panel):
         box.prop(settings, "root_scale")
         box.prop(settings, "location_offset")
         box.prop(settings, "rotation_offset")
-        box.prop(settings, "bvh_position_offset")
 
         # Motion smoothing
         box = layout.box()

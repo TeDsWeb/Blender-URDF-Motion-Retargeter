@@ -31,6 +31,56 @@ from .utils import (
 )
 
 
+# Axis name → unit vector lookup (avoids repeated if/elif chains)
+_AXIS_VECTORS = {
+    "X": mathutils.Vector((1, 0, 0)),
+    "Y": mathutils.Vector((0, 1, 0)),
+    "Z": mathutils.Vector((0, 0, 1)),
+}
+
+
+def _apply_final_angle(
+    urdf_bone,
+    angle: float,
+    joint_type: str,
+) -> None:
+    """
+    Clamp *angle* to joint limits (if revolute), store it as a custom
+    property, and write it into the bone's quaternion rotation.
+
+    Args:
+        urdf_bone: The URDF pose-bone to update.
+        angle:     Target joint angle in radians.
+        joint_type: "revolute", "continuous", etc.
+    """
+    if joint_type != "continuous":
+        l_min = get_bone_property(urdf_bone, "limit_lower", -3.14)
+        l_max = get_bone_property(urdf_bone, "limit_upper", 3.14)
+        angle = clamp_to_limits(angle, l_min, l_max)
+
+    set_bone_property(urdf_bone, "_joint_angle", angle)
+    urdf_bone.rotation_mode = "QUATERNION"
+    urdf_bone.rotation_quaternion = mathutils.Quaternion((0, 1, 0), angle)
+
+
+def _find_urdf_foot_for_anchor(
+    anchor_bone_name: str,
+    settings,
+    urdf_obj: bpy.types.Object,
+):
+    """
+    Look up the URDF pose-bone that corresponds to a BVH anchor foot.
+
+    Returns the last bone in the mapping chain (the actual foot/toe tip)
+    or *None* if no mapping exists.
+    """
+    for item in settings.mappings:
+        if item.bvh_bone_name == anchor_bone_name and item.urdf_bones:
+            name = item.urdf_bones[-1].urdf_bone_name
+            return urdf_obj.pose.bones.get(name)
+    return None
+
+
 def get_lowest_z_world(urdf_obj: bpy.types.Object) -> float:
     """
     Find the lowest Z-coordinate (height) of all visual meshes in world space.
@@ -192,15 +242,10 @@ def apply_joint_retargeting(
         if jtype not in {"revolute", "continuous"}:
             continue
 
-        # Define the twist axis in BVH local space
-        if urdf_bone_mapping.source_axis == "X":
-            twist_axis = mathutils.Vector((1, 0, 0))
-        elif urdf_bone_mapping.source_axis == "Y":
-            twist_axis = mathutils.Vector((0, 1, 0))
-        else:
-            twist_axis = mathutils.Vector((0, 0, 1))
-
-        # Extract rotation around the twist axis
+        # Extract rotation around the selected twist axis
+        twist_axis = _AXIS_VECTORS.get(
+            urdf_bone_mapping.source_axis, _AXIS_VECTORS["Z"]
+        )
         val = extract_twist_angle(delta_q, twist_axis)
 
         # Apply continuity correction (anti-flip)
@@ -247,18 +292,8 @@ def apply_joint_retargeting(
         )
         set_bone_property(urdf_b, "_last_urdf_angle", final_angle)
 
-        # Clamp to joint limits
-        if jtype != "continuous":
-            l_min = get_bone_property(urdf_b, "limit_lower", -3.14)
-            l_max = get_bone_property(urdf_b, "limit_upper", 3.14)
-            final_angle = clamp_to_limits(final_angle, l_min, l_max)
-
-        # Store for export
-        set_bone_property(urdf_b, "_joint_angle", final_angle)
-
-        # Apply rotation
-        urdf_b.rotation_mode = "QUATERNION"
-        urdf_b.rotation_quaternion = mathutils.Quaternion((0, 1, 0), final_angle)
+        # Clamp, store and apply
+        _apply_final_angle(urdf_b, final_angle, jtype)
 
 
 def apply_foot_alignment(
@@ -312,7 +347,7 @@ def apply_foot_alignment(
             if jtype not in {"revolute", "continuous"}:
                 continue
 
-            # Get foot world position
+            # Get foot world transform
             foot_mat_world = urdf_obj.matrix_world @ urdf_b.matrix
             foot_pos = foot_mat_world.to_translation()
 
@@ -328,8 +363,7 @@ def apply_foot_alignment(
                 continue
 
             # Calculate alignment correction
-            current_foot_mat = urdf_obj.matrix_world @ urdf_b.matrix
-            current_foot_q = current_foot_mat.to_quaternion()
+            current_foot_q = foot_mat_world.to_quaternion()
 
             actual_up = current_foot_q @ mathutils.Vector((0, 0, 1))
             target_up = mathutils.Vector((0, 0, 1))
@@ -354,19 +388,9 @@ def apply_foot_alignment(
                 )
             smooth_cache[cache_val_key] = val
 
-            # Blend with current angle and apply limits
+            # Blend with current angle, clamp, store and apply
             current_joint_angle = get_bone_property(urdf_b, "_joint_angle", 0.0)
-            final_angle = current_joint_angle + val * influence
-
-            if jtype != "continuous":
-                l_min = get_bone_property(urdf_b, "limit_lower", -3.14)
-                l_max = get_bone_property(urdf_b, "limit_upper", 3.14)
-                final_angle = clamp_to_limits(final_angle, l_min, l_max)
-
-            # Store and apply
-            set_bone_property(urdf_b, "_joint_angle", final_angle)
-            urdf_b.rotation_mode = "QUATERNION"
-            urdf_b.rotation_quaternion = mathutils.Quaternion((0, 1, 0), final_angle)
+            _apply_final_angle(urdf_b, current_joint_angle + val * influence, jtype)
 
 
 @persistent
@@ -418,19 +442,14 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     # 1.  BVH root position  (scaled delta from reference)
     # ------------------------------------------------------------------
     bvh_root_mat = bvh.matrix_world @ bvh.pose.bones[0].matrix
-    bvh_offset = mathutils.Vector(settings.bvh_position_offset)
-    current_bvh_pos = bvh_root_mat.to_translation() + bvh_offset
+    current_bvh_pos = bvh_root_mat.to_translation()
     ref_pos = mathutils.Vector(scene.get("ref_root_pos", current_bvh_pos))
-    bvh_floor_offset = scene.get("bvh_floor_offset", 0.0)
-
-    corrected_z = current_bvh_pos.z - bvh_floor_offset
-    ref_z = ref_pos.z - bvh_floor_offset
 
     bvh_delta = mathutils.Vector(
         (
             (current_bvh_pos.x - ref_pos.x) * settings.root_scale,
             (current_bvh_pos.y - ref_pos.y) * settings.root_scale,
-            (corrected_z - ref_z) * settings.root_scale,
+            (current_bvh_pos.z - ref_pos.z) * settings.root_scale,
         )
     )
 
@@ -497,17 +516,10 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     is_first_anchor = anchor_bone_name != "" and last_anchor == ""
 
     # ------------------------------------------------------------------
-    # 7.  Sticky-foot correction  (single pass, 100 % strength)
+    # 7.  Sticky-foot correction
     # ------------------------------------------------------------------
     if anchor_bone_name:
-        # Find URDF foot bone that corresponds to the BVH anchor
-        urdf_foot_bone = None
-        for item in settings.mappings:
-            if item.bvh_bone_name == anchor_bone_name:
-                if item.urdf_bones:
-                    urdf_foot_name = item.urdf_bones[-1].urdf_bone_name
-                    urdf_foot_bone = urdf.pose.bones.get(urdf_foot_name)
-                break
+        urdf_foot_bone = _find_urdf_foot_for_anchor(anchor_bone_name, settings, urdf)
 
         if urdf_foot_bone:
             foot_world = (urdf.matrix_world @ urdf_foot_bone.matrix).to_translation()
