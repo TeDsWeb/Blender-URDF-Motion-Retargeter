@@ -4,6 +4,17 @@ Motion retargeting engine for BVH-to-URDF animation mapping.
 Provides the core retargeting handler that synchronizes BVH motion capture
 data to URDF robot kinematics, including root motion projection,
 joint retargeting, foot alignment, and anti-sinking corrections.
+
+Foot-planting uses a single-pass "persistent correction" approach:
+  1. Root is positioned at BVH_delta + persistent_correction + manual offset.
+  2. Full FK (joint angles + foot alignment) is applied, then the scene is updated.
+  3. The world position of the stance foot is compared against a fixed anchor.
+  4. Any XY drift is subtracted from the root and written back into
+     persistent_correction so the fix carries over to the next frame.
+  5. On stance-foot switch the NEW foot's current (already-corrected) world
+     position becomes the anchor — no jump, no fade required.
+  6. During airborne phases (jump) persistent_correction is frozen; on landing
+     the first grounded foot sets a fresh anchor.
 """
 
 import bpy
@@ -58,114 +69,85 @@ def get_lowest_z_world(urdf_obj: bpy.types.Object) -> float:
     return global_min_z
 
 
-def apply_root_motion_correction(
+def detect_stance_foot(
     scene: bpy.types.Scene,
-    urdf_obj: bpy.types.Object,
     bvh_obj: bpy.types.Object,
     settings,
-) -> tuple[mathutils.Vector, mathutils.Quaternion]:
+) -> tuple[str, bool]:
     """
-    Calculate root position and rotation corrections for pivot-based anchoring.
+    Determine which BVH foot is the current stance foot (ground anchor).
 
-    Uses "sticky foot" logic: if a foot remains in contact, its position is held constant
-    while the root moves, preventing foot-slip artifacts. Includes smoothed drift correction
-    to reduce jitter from measurement noise.
+    Uses ground-contact height threshold combined with per-foot velocity to
+    pick the most stable grounded foot.  Hysteresis prevents rapid flicker
+    between feet.
 
     Args:
-        scene: The Blender scene object (contains cached state).
-        urdf_obj: The URDF armature to be retargeted.
+        scene:   The Blender scene (stores inter-frame tracking state).
         bvh_obj: The BVH source armature.
-        settings: BVHMappingSettings with foot bone names and smoothing parameters.
+        settings: BVHMappingSettings with foot bone names and jump_threshold.
 
     Returns:
-        Tuple of (pivot_correction, rotation_correction) to apply to the URDF root.
+        (anchor_bone_name, is_anchor_switch)
+        anchor_bone_name is "" when both feet are airborne (jump).
     """
-    pivot_correction = mathutils.Vector((0, 0, 0))
-    rotation_correction = mathutils.Quaternion((1, 0, 0, 0))
-
-    # Get BVH root position and rotation (with optional position offset for grounding)
-    bvh_root_mat = bvh_obj.matrix_world @ bvh_obj.pose.bones[0].matrix
-    bvh_offset = mathutils.Vector(settings.bvh_position_offset)
-    bvh_root_mat.translation += bvh_offset
     bvh_floor_offset = scene.get("bvh_floor_offset", 0.0)
 
-    # Identify which feet are in contact (sticky anchor selection)
-    active_bvh_contacts = []
-    for f_name in [settings.foot_l_name, settings.foot_r_name]:
+    # --- velocity tracking ---
+    if "_foot_positions" not in scene:
+        scene["_foot_positions"] = {}
+    last_positions = scene["_foot_positions"]
+
+    active_contacts: list[str] = []
+    foot_velocities: dict[str, float] = {}
+
+    for f_name in (settings.foot_l_name, settings.foot_r_name):
         bvh_bone = bvh_obj.pose.bones.get(f_name)
-        if bvh_bone:
-            foot_world_pos = (bvh_obj.matrix_world @ bvh_bone.matrix).to_translation()
-            if (foot_world_pos.z - bvh_floor_offset) <= settings.jump_threshold:
-                active_bvh_contacts.append(f_name)
+        if not bvh_bone:
+            continue
 
-    last_anchor_name = scene.get("_active_anchor_name", "")
-    anchor_bone_name = ""
+        foot_world = (bvh_obj.matrix_world @ bvh_bone.matrix).to_translation()
+        foot_height = foot_world.z - bvh_floor_offset
 
-    # 1. Sticky Selection: keep current foot if it's still in contact
-    if last_anchor_name in active_bvh_contacts:
-        anchor_bone_name = last_anchor_name
-        is_hard_switch = False
-    elif active_bvh_contacts:
-        anchor_bone_name = sorted(active_bvh_contacts)[0]
-        is_hard_switch = True
-    else:
-        anchor_bone_name = ""
-
-    if anchor_bone_name:
-        bvh_anchor_bone = bvh_obj.pose.bones.get(anchor_bone_name)
-        current_bvh_anchor_mat = bvh_obj.matrix_world @ bvh_anchor_bone.matrix
-        current_bvh_anchor_pos = current_bvh_anchor_mat.to_translation()
-        current_bvh_anchor_quat = current_bvh_anchor_mat.to_quaternion()
-        current_rel_pos = bvh_root_mat.inverted() @ current_bvh_anchor_pos
-
-        if is_hard_switch or last_anchor_name == "":
-            # Offset-Transfer: prevents jump when switching feet
-            scene["_last_bvh_rel_pos"] = current_rel_pos
-            scene["_last_bvh_anchor_quat"] = current_bvh_anchor_quat
-            scene["_last_applied_pivot_corr"] = mathutils.Vector((0, 0, 0))
+        # velocity (frame-to-frame displacement)
+        if f_name in last_positions:
+            vel = (foot_world - mathutils.Vector(last_positions[f_name])).length
         else:
-            # Calculate drift and apply smoothing
-            last_rel_pos = mathutils.Vector(
-                scene.get("_last_bvh_rel_pos", current_rel_pos)
-            )
-            raw_drift = (current_rel_pos - last_rel_pos) * settings.root_scale
+            vel = 0.0
+        foot_velocities[f_name] = vel
+        last_positions[f_name] = foot_world.copy()
 
-            # Damping: smooth out high-frequency drift noise
-            smoothing_factor = 0.6
-            last_corr = mathutils.Vector(
-                scene.get("_last_applied_pivot_corr", (0, 0, 0))
-            )
-            pivot_correction = last_corr.lerp(raw_drift, smoothing_factor)
-            pivot_correction.z = 0  # Only XY plane adjustment for foot planting
+        if foot_height <= settings.jump_threshold:
+            active_contacts.append(f_name)
 
-            # Rotation drift correction
-            last_anchor_quat = mathutils.Quaternion(
-                scene.get("_last_bvh_anchor_quat", current_bvh_anchor_quat)
-            )
-            rot_drift = current_bvh_anchor_quat @ last_anchor_quat.inverted()
-            rot_drift_euler = rot_drift.to_euler()
-            rot_drift_quat = mathutils.Euler(
-                (
-                    -rot_drift_euler.x * 0.5,
-                    rot_drift_euler.y * 0.5,
-                    -rot_drift_euler.z,
-                ),
-                "XYZ",
-            ).to_quaternion()
-            rotation_correction = mathutils.Quaternion((1, 0, 0, 0)).slerp(
-                rot_drift_quat.inverted(), smoothing_factor
-            )
+    # --- anchor selection ---
+    last_anchor = scene.get("_active_anchor_name", "")
+    anchor_bone_name = ""
+    is_switch = False
 
-        # Update state cache
-        scene["_active_anchor_name"] = anchor_bone_name
-        scene["_last_bvh_rel_pos"] = current_rel_pos
-        scene["_last_bvh_anchor_quat"] = current_bvh_anchor_quat
-        scene["_last_applied_pivot_corr"] = pivot_correction
-    else:
-        scene["_active_anchor_name"] = ""
-        scene["_last_applied_pivot_corr"] = mathutils.Vector((0, 0, 0))
+    if last_anchor in active_contacts:
+        # Current anchor still grounded — keep it unless the other foot is
+        # significantly more stable (< 50 % velocity AND < 1 cm/frame).
+        anchor_bone_name = last_anchor
+        cur_vel = foot_velocities.get(last_anchor, 0.0)
+        for other in active_contacts:
+            if other != last_anchor:
+                other_vel = foot_velocities.get(other, 0.0)
+                if other_vel < cur_vel * 0.5 and other_vel < 0.01:
+                    anchor_bone_name = other
+                    is_switch = True
+                    break
 
-    return pivot_correction, rotation_correction
+    elif active_contacts:
+        # Previous anchor lifted — pick the stillest grounded foot.
+        anchor_bone_name = min(
+            active_contacts,
+            key=lambda f: foot_velocities.get(f, float("inf")),
+        )
+        is_switch = last_anchor != anchor_bone_name and last_anchor != ""
+
+    # else: both feet airborne → anchor_bone_name stays ""
+
+    return anchor_bone_name, is_switch
 
 
 def apply_joint_retargeting(
@@ -390,11 +372,17 @@ def apply_foot_alignment(
 @persistent
 def retarget_frame(scene: bpy.types.Scene) -> None:
     """
-    Frame change handler that performs real-time BVH-to-URDF retargeting.
+    Frame-change handler: single-pass BVH-to-URDF retargeting with foot planting.
 
-    This function is called on every frame change. It processes root motion projection,
-    joint retargeting, foot alignment, and anti-sinking corrections to synchronize
-    the URDF robot with BVH motion capture data.
+    Pipeline per frame:
+        1. Set URDF root = BVH_delta + persistent_correction + manual offset
+        2. Set URDF root rotation from BVH (axis-corrected, damped)
+        3. Joint retargeting (FK)
+        4. Foot alignment (flatten near ground)
+        5. scene update
+        6. Detect stance foot  →  measure URDF foot world position
+        7. Drift = foot_xy − anchor_xy  →  correct root, update persistent_correction
+        8. Anti-sinking guard
 
     Args:
         scene: The current Blender scene.
@@ -408,7 +396,7 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     if not urdf or not bvh:
         return
 
-    # Initialize smoothing cache if needed
+    # Smoothing cache (shared across joints)
     if "_bvh_smooth_cache" not in scene:
         scene["_bvh_smooth_cache"] = {}
     smooth_cache = scene["_bvh_smooth_cache"]
@@ -416,65 +404,153 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     if not bvh.pose.bones:
         return
 
-    # --- ROOT MOTION & PIVOT CORRECTION ---
-    pivot_correction, rotation_correction = apply_root_motion_correction(
-        scene, urdf, bvh, settings
-    )
+    # ------------------------------------------------------------------
+    # Reset state at the first frame to avoid drift from previous plays
+    # ------------------------------------------------------------------
+    current_frame = scene.frame_current
+    if current_frame == 0 or current_frame == scene.frame_start:
+        scene["_persistent_foot_correction"] = mathutils.Vector((0, 0, 0))
+        scene["_active_anchor_name"] = ""
+        scene["_anchor_world_pos_xy"] = None
+        scene["_foot_positions"] = {}
 
-    # Apply root rotation
-    urdf.rotation_mode = "QUATERNION"
-    urdf.rotation_quaternion = rotation_correction @ urdf.rotation_quaternion
-
-    # Get reference position for Z-axis handling (with BVH position offset for grounding)
+    # ------------------------------------------------------------------
+    # 1.  BVH root position  (scaled delta from reference)
+    # ------------------------------------------------------------------
     bvh_root_mat = bvh.matrix_world @ bvh.pose.bones[0].matrix
     bvh_offset = mathutils.Vector(settings.bvh_position_offset)
     current_bvh_pos = bvh_root_mat.to_translation() + bvh_offset
     ref_pos = mathutils.Vector(scene.get("ref_root_pos", current_bvh_pos))
     bvh_floor_offset = scene.get("bvh_floor_offset", 0.0)
 
-    # Calculate vertical movement
-    corrected_current_z = current_bvh_pos.z - bvh_floor_offset
-    delta_z = (
-        corrected_current_z - (ref_pos.z - bvh_floor_offset)
-    ) * settings.root_scale
+    corrected_z = current_bvh_pos.z - bvh_floor_offset
+    ref_z = ref_pos.z - bvh_floor_offset
 
-    # Apply position
-    target_loc = (
-        mathutils.Vector(
-            (
-                (current_bvh_pos.x - ref_pos.x) * settings.root_scale,
-                (current_bvh_pos.y - ref_pos.y) * settings.root_scale,
-                delta_z,
-            )
+    bvh_delta = mathutils.Vector(
+        (
+            (current_bvh_pos.x - ref_pos.x) * settings.root_scale,
+            (current_bvh_pos.y - ref_pos.y) * settings.root_scale,
+            (corrected_z - ref_z) * settings.root_scale,
         )
-        - pivot_correction
+    )
+
+    # Persistent correction carries the accumulated foot-pinning offset
+    persistent_correction = mathutils.Vector(
+        scene.get("_persistent_foot_correction", (0, 0, 0))
     )
 
     offset_xy = settings.location_offset
     loc_offset = mathutils.Vector(
         (offset_xy[0], offset_xy[1], scene.get("urdf_height_offset", 0.0))
     )
-    urdf.location = target_loc + loc_offset
 
-    # Apply root rotation offset
-    ref_rot = mathutils.Quaternion(scene.get("ref_root_rot", current_bvh_pos))
+    urdf.location = bvh_delta + persistent_correction + loc_offset
+
+    # ------------------------------------------------------------------
+    # 2.  BVH root rotation  (axis-corrected, pitch/roll damped)
+    # ------------------------------------------------------------------
+    ref_rot = mathutils.Quaternion(scene.get("ref_root_rot", (1, 0, 0, 0)))
     off_q = mathutils.Euler(settings.rotation_offset).to_quaternion()
     current_bvh_rot = bvh_root_mat.to_quaternion()
-    delta_rot = (current_bvh_rot @ ref_rot.inverted()).inverted()
+
+    delta_rot = current_bvh_rot @ ref_rot.inverted()
     delta_rot.x *= -1
-    delta_rot.z *= -1
+    delta_rot.y *= -1
+
+    delta_rot_euler = delta_rot.to_euler()
+    damping_xy = settings.root_scale
+
+    delta_rot = mathutils.Euler(
+        (
+            delta_rot_euler.x * damping_xy,
+            delta_rot_euler.y * damping_xy,
+            delta_rot_euler.z,
+        ),
+        "XYZ",
+    ).to_quaternion()
+
+    urdf.rotation_mode = "QUATERNION"
     urdf.rotation_quaternion = off_q @ delta_rot
 
-    # --- JOINT RETARGETING ---
+    # ------------------------------------------------------------------
+    # 3.  Joint retargeting  (FK)
+    # ------------------------------------------------------------------
     for item in settings.mappings:
         apply_joint_retargeting(urdf, bvh, item, smooth_cache, settings, scene)
 
-    # --- FOOT ALIGNMENT ---
+    # ------------------------------------------------------------------
+    # 4.  Foot alignment  (flatten near ground)
+    # ------------------------------------------------------------------
     apply_foot_alignment(urdf, bvh, settings, smooth_cache, scene)
 
-    # --- ANTI-SINKING CHECK ---
+    # ------------------------------------------------------------------
+    # 5.  Scene update so matrix_world is current for the measurement step
+    # ------------------------------------------------------------------
+    bpy.context.view_layer.update()
+
+    # ------------------------------------------------------------------
+    # 6.  Detect stance foot  (BVH space)
+    # ------------------------------------------------------------------
+    anchor_bone_name, is_anchor_switch = detect_stance_foot(scene, bvh, settings)
+
+    last_anchor = scene.get("_active_anchor_name", "")
+    is_first_anchor = anchor_bone_name != "" and last_anchor == ""
+
+    # ------------------------------------------------------------------
+    # 7.  Sticky-foot correction  (single pass, 100 % strength)
+    # ------------------------------------------------------------------
+    if anchor_bone_name:
+        # Find URDF foot bone that corresponds to the BVH anchor
+        urdf_foot_bone = None
+        for item in settings.mappings:
+            if item.bvh_bone_name == anchor_bone_name:
+                if item.urdf_bones:
+                    urdf_foot_name = item.urdf_bones[-1].urdf_bone_name
+                    urdf_foot_bone = urdf.pose.bones.get(urdf_foot_name)
+                break
+
+        if urdf_foot_bone:
+            foot_world = (urdf.matrix_world @ urdf_foot_bone.matrix).to_translation()
+
+            if is_anchor_switch or is_first_anchor:
+                # ---  New anchor  ---
+                # Record where the foot IS right now (already includes all
+                # previous corrections via persistent_correction).
+                # No drift correction this frame → seamless transition.
+                scene["_anchor_world_pos_xy"] = (foot_world.x, foot_world.y)
+
+            # Retrieve anchor target (may have just been set above)
+            anchor_xy = scene.get("_anchor_world_pos_xy", None)
+
+            if anchor_xy is not None:
+                anchor_x, anchor_y = anchor_xy
+
+                drift_x = foot_world.x - anchor_x
+                drift_y = foot_world.y - anchor_y
+
+                # Correct root 100 % — translation is additive, so this is exact
+                urdf.location.x -= drift_x
+                urdf.location.y -= drift_y
+
+                # Write correction back so it carries into next frame
+                persistent_correction.x -= drift_x
+                persistent_correction.y -= drift_y
+                scene["_persistent_foot_correction"] = persistent_correction
+
+        scene["_active_anchor_name"] = anchor_bone_name
+
+    else:
+        # Both feet airborne (jump) — freeze correction, clear anchor.
+        # persistent_correction is NOT modified, so the offset from the
+        # last stance phase is preserved and landing is seamless.
+        scene["_active_anchor_name"] = ""
+        scene["_anchor_world_pos_xy"] = None
+
+    # ------------------------------------------------------------------
+    # 8.  Anti-sinking guard
+    # ------------------------------------------------------------------
     bpy.context.view_layer.update()
     current_min_z = get_lowest_z_world(urdf)
 
-    if current_min_z < -1e-4:  # Allow tiny epsilon for numerical stability
+    if current_min_z < -1e-4:
         urdf.location.z += abs(current_min_z)
