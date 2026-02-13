@@ -54,6 +54,7 @@ from .operators import (
     menu_func_import,
 )
 from .export import OT_ExportBeyondMimic
+from .import_csv import OT_ImportBeyondMimic
 from .retargeting import retarget_frame
 
 
@@ -80,6 +81,7 @@ classes = [
     OT_ClearScene,
     IMPORT_OT_urdf_humanoid,
     OT_ExportBeyondMimic,
+    OT_ImportBeyondMimic,
 ]
 
 

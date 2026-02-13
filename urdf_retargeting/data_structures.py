@@ -203,3 +203,21 @@ class BVHMappingSettings(PropertyGroup):
         default=0,
         min=0,
     )
+
+    # Import
+    import_use_meta_hz: BoolProperty(
+        name="Use Meta Hz",
+        description="If a matching _meta.json exists, use its export_hz",
+        default=True,
+    )
+    import_manual_hz: FloatProperty(
+        name="Manual Hz",
+        description="Override the sample rate (Hz) when not using meta",
+        default=0.0,
+        min=0.0,
+    )
+    import_set_scene_fps: BoolProperty(
+        name="Set Scene FPS",
+        description="Set scene FPS to the import sample rate",
+        default=True,
+    )

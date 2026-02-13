@@ -291,10 +291,23 @@ class PANEL_ApplyAndExport(Panel):
         row.prop(settings, "export_from_frame", text="From")
         row.prop(settings, "export_to_frame", text="To")
 
-        op = box.operator("object.export_beyond_mimic", text="Export to BeyondMimic")
+        op = box.operator("object.export_beyond_mimic", text="Export BeyondMimic")
         # pass current UI settings as defaults to the operator so file-browser shows them
         op.export_from_frame = settings.export_from_frame
         op.export_to_frame = settings.export_to_frame
+
+        # Import section
+        box = layout.box()
+        box.label(text="Import", icon="IMPORT")
+        box.prop(settings, "import_use_meta_hz", text="Use Meta Hz")
+        row = box.row(align=True)
+        row.prop(settings, "import_manual_hz", text="Hz")
+        row.enabled = not settings.import_use_meta_hz
+        box.prop(settings, "import_set_scene_fps", text="Set Scene FPS")
+        op = box.operator("object.import_beyond_mimic", text="Import BeyondMimic")
+        op.use_meta_hz = settings.import_use_meta_hz
+        op.manual_hz = settings.import_manual_hz
+        op.set_scene_fps = settings.import_set_scene_fps
 
         # Danger: Clear scene
         box = layout.box()
