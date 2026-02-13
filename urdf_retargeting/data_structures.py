@@ -145,6 +145,23 @@ class BVHMappingSettings(PropertyGroup):
         min=0.0,
         max=1.0,
     )
+    correction_decay: FloatProperty(
+        name="Correction Decay (%)",
+        description=(
+            "Decay percentage for foot-planting corrections "
+            "(reference: 120 FPS). Value is interpreted as a "
+            "percentage: 0.05 ≈ 0.05 %% per frame at 120 FPS. "
+            "Automatically scaled to the scene frame-rate so the "
+            "effective decay per second stays constant. "
+            "Pulls the URDF root back toward the BVH trajectory "
+            "to prevent unbounded drift "
+            "(0 = sticky feet / no decay, 1 = full decay / no correction)"
+        ),
+        default=0.05,
+        min=0.0,
+        max=1.0,
+        step=0.01,
+    )
 
     # Root Motion
     root_scale: FloatProperty(

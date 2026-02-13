@@ -9,6 +9,7 @@ import bpy
 import os
 import csv
 import json
+import mathutils
 from bpy.types import Operator
 
 
@@ -35,83 +36,76 @@ class OT_ExportBeyondMimic(Operator):
 
     # Internal Modal State
     _timer = None
-    _num_steps = 0
-    _current_step = 0
-    _time_per_step = 0
     _duration = 0
     _total_frames = 0
-    _data_rows = []
+    _raw_frames = []  # per-integer-frame data (Pass 1)
+    _data_rows = []  # resampled output   (Pass 2)
     _meta_joints = {}
     _csv_path = ""
     _json_path = ""
     _orig_frame = 0
     _joints = []
     _base_name = ""
+    _eval_frame = 0
 
     def modal(self, context, event):
-        """Modal handler for progressive export."""
+        """Modal handler — Pass 1: evaluate every frame sequentially.
+
+        Walking through every integer frame guarantees that the
+        retarget_frame handler accumulates its persistent state
+        (foot corrections, smooth caches) in the correct order.
+        Resampling to target_hz happens in finish() (Pass 2).
+        """
         scene = context.scene
         urdf = scene.urdf_rig_object
-        fps = scene.render.fps
 
         if event.type == "ESC":
             return self.cancel(context)
 
         if event.type == "TIMER":
-            if self._current_step < self._num_steps:
-                # Calculate current time and map back to Blender frame
-                current_time_secs = self._current_step * self._time_per_step
-                blender_frame = scene.frame_start + (current_time_secs * fps)
+            if self._eval_frame <= scene.frame_end:
+                # Evaluate this frame (triggers retarget_frame handler)
+                scene.frame_set(self._eval_frame)
 
-                # Set frame with subframe for smooth interpolation
-                scene.frame_set(int(blender_frame), subframe=blender_frame % 1.0)
+                # Collect root data (translation + quaternion)
+                row = [
+                    urdf.location.x,
+                    urdf.location.y,
+                    urdf.location.z,
+                    urdf.rotation_quaternion.x,
+                    urdf.rotation_quaternion.y,
+                    urdf.rotation_quaternion.z,
+                    urdf.rotation_quaternion.w,
+                ]
 
-                # Only append rows that fall within the user-specified export frame range.
-                # We still advance through all samples (so animation is fully evaluated),
-                # but write output only for frames between export_from and export_to.
-                if blender_frame >= getattr(
-                    self, "_export_from_frame", scene.frame_start
-                ) and blender_frame <= getattr(
-                    self, "_export_to_frame", scene.frame_end
-                ):
-                    # Collect root data (translation + quaternion)
-                    row = [
-                        urdf.location.x,
-                        urdf.location.y,
-                        urdf.location.z,
-                        urdf.rotation_quaternion.x,
-                        urdf.rotation_quaternion.y,
-                        urdf.rotation_quaternion.z,
-                        urdf.rotation_quaternion.w,
-                    ]
+                # Collect joint angles
+                for j in self._joints:
+                    pb = urdf.pose.bones[j]
+                    row.append(pb.get("_joint_angle", 0.0))
 
-                    # Collect joint angles
-                    for j in self._joints:
-                        pb = urdf.pose.bones[j]
-                        row.append(pb.get("_joint_angle", 0.0))
+                    # Store metadata once per joint
+                    if j not in self._meta_joints:
+                        self._meta_joints[j] = {
+                            "lower": pb.get("limit_lower", -3.14),
+                            "upper": pb.get("limit_upper", 3.14),
+                        }
 
-                        # Store metadata once when we append the first exported sample
-                        if not self._meta_joints:
-                            self._meta_joints[j] = {
-                                "lower": pb.get("limit_lower", -3.14),
-                                "upper": pb.get("limit_upper", 3.14),
-                            }
-
-                    self._data_rows.append(row)
+                self._raw_frames.append(row)
 
                 # UI update
+                progress = self._eval_frame - scene.frame_start
                 context.workspace.status_text_set(
-                    f"Export Beyond Mimic: Step {self._current_step}/{self._num_steps} | ESC to Cancel"
+                    f"Export Pass 1/2: Frame {self._eval_frame}/{scene.frame_end} | ESC to Cancel"
                 )
-                context.window_manager.progress_update(self._current_step)
-                self._current_step += 1
+                context.window_manager.progress_update(progress)
+                self._eval_frame += 1
             else:
                 return self.finish(context)
 
         return {"RUNNING_MODAL"}
 
     def execute(self, context):
-        """Initialize export parameters and start modal loop."""
+        """Initialize export and start sequential frame evaluation."""
         scene = context.scene
         settings = scene.bvh_mapping_settings
         urdf, bvh = scene.urdf_rig_object, scene.bvh_rig_object
@@ -125,13 +119,10 @@ class OT_ExportBeyondMimic(Operator):
         self._csv_path = os.path.join(self.directory, f"{self._base_name}.csv")
         self._json_path = os.path.join(self.directory, f"{self._base_name}_meta.json")
 
-        # Setup resampling
+        # Timing info (used during resampling in finish())
         fps = scene.render.fps
         self._total_frames = scene.frame_end - scene.frame_start
         self._duration = self._total_frames / fps
-        target_hz = settings.target_hz
-        self._num_steps = int(self._duration * target_hz) + 1
-        self._time_per_step = 1.0 / target_hz
 
         # Resolve export frame range (prefer operator props, then UI settings, then scene range)
         if self.export_from_frame > 0:
@@ -156,28 +147,101 @@ class OT_ExportBeyondMimic(Operator):
         self._export_to_frame = exp_to
 
         self._joints = list(urdf.get("urdf_joint_order", []))
-        self._current_step = 0
+        self._eval_frame = scene.frame_start
+        self._raw_frames = []
         self._data_rows = []
         self._meta_joints = {}
         self._orig_frame = scene.frame_current
 
-        # Start modal loop
+        # Start modal loop — progress tracks frame evaluation
         wm = context.window_manager
-        # Show brief info in the workspace status about the export range
         context.workspace.status_text_set(
             f"Exporting frames {self._export_from_frame}..{self._export_to_frame} → {self._base_name} ({settings.target_hz}Hz)"
         )
-        wm.progress_begin(0, self._num_steps)
+        wm.progress_begin(0, self._total_frames)
         self._timer = wm.event_timer_add(0.001, window=context.window)
         wm.modal_handler_add(self)
 
         return {"RUNNING_MODAL"}
 
+    def _resample_to_target_hz(self, scene):
+        """Resample raw per-frame data to target_hz with interpolation.
+
+        Uses linear interpolation for positions and joint angles, and
+        quaternion SLERP for root orientation.  Only samples that fall
+        within [export_from_frame, export_to_frame] are emitted.
+
+        Returns:
+            List of resampled rows.
+        """
+        settings = scene.bvh_mapping_settings
+        fps = scene.render.fps
+        target_hz = settings.target_hz
+
+        if not self._raw_frames:
+            return []
+
+        total_src = len(self._raw_frames)  # one entry per integer frame
+        duration_secs = (total_src - 1) / fps
+        num_samples = max(int(duration_secs * target_hz) + 1, 1)
+
+        resampled = []
+        for step in range(num_samples):
+            t_secs = step / target_hz
+
+            # Fractional source-frame index (relative to frame_start)
+            src_idx_f = t_secs * fps
+
+            # Corresponding Blender frame for range check
+            blender_frame = scene.frame_start + src_idx_f
+            if blender_frame < self._export_from_frame:
+                continue
+            if blender_frame > self._export_to_frame:
+                break
+
+            # Clamp to collected range
+            src_idx_f = max(0.0, min(src_idx_f, total_src - 1))
+            idx_lo = int(src_idx_f)
+            idx_hi = min(idx_lo + 1, total_src - 1)
+            frac = src_idx_f - idx_lo
+
+            if idx_lo == idx_hi or frac < 1e-6:
+                resampled.append(list(self._raw_frames[idx_lo]))
+                continue
+
+            row_a = self._raw_frames[idx_lo]
+            row_b = self._raw_frames[idx_hi]
+            row = []
+
+            # Root position (indices 0-2): linear interpolation
+            for i in range(3):
+                row.append(row_a[i] + (row_b[i] - row_a[i]) * frac)
+
+            # Root quaternion (indices 3-6, stored x,y,z,w): SLERP
+            qa = mathutils.Quaternion(
+                (row_a[6], row_a[3], row_a[4], row_a[5])  # w,x,y,z
+            )
+            qb = mathutils.Quaternion((row_b[6], row_b[3], row_b[4], row_b[5]))
+            qi = qa.slerp(qb, frac)
+            row.extend([qi.x, qi.y, qi.z, qi.w])
+
+            # Joint angles (indices 7+): linear interpolation
+            for i in range(7, len(row_a)):
+                row.append(row_a[i] + (row_b[i] - row_a[i]) * frac)
+
+            resampled.append(row)
+
+        return resampled
+
     def finish(self, context):
-        """Write CSV and JSON files and finalize export."""
+        """Resample collected data to target Hz, then write CSV and JSON."""
         scene = context.scene
         settings = scene.bvh_mapping_settings
         urdf = scene.urdf_rig_object
+
+        # Pass 2: resample sequential per-frame data to target Hz
+        context.workspace.status_text_set("Export Pass 2/2: Resampling…")
+        self._data_rows = self._resample_to_target_hz(scene)
 
         # Create CSV header
         header = [

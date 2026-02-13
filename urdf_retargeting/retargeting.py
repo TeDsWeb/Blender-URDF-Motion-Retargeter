@@ -7,17 +7,32 @@ joint retargeting, foot alignment, and anti-sinking corrections.
 
 Foot-planting uses a single-pass "persistent correction" approach:
   1. Root is positioned at BVH_delta + persistent_correction + manual offset.
+     Root rotation includes a persistent yaw correction quaternion.
   2. Full FK (joint angles + foot alignment) is applied, then the scene is updated.
-  3. The world position of the stance foot is compared against a fixed anchor.
-  4. Any XY drift is subtracted from the root and written back into
-     persistent_correction so the fix carries over to the next frame.
-  5. On stance-foot switch the NEW foot's current (already-corrected) world
-     position becomes the anchor — no jump, no fade required.
-  6. During airborne phases (jump) persistent_correction is frozen; on landing
-     the first grounded foot sets a fresh anchor.
+  3. The world yaw and XY position of the stance foot are compared against
+     a fixed anchor.  Yaw comparison is BVH-relative: only the FK error
+     (URDF yaw change minus BVH yaw change since anchor) is corrected,
+     so intentional foot rotation from the motion-capture is preserved.
+  4. Because persistent_rot_correction is already applied in step 1, the
+     measurement captures only the residual FK error.  This residual is
+     added as an increment to persistent_rot_correction.  The approach is
+     self-correcting: if the FK error vanishes (pose returns to neutral)
+     the residual flips sign and decays the correction back to identity.
+  5. The yaw correction pivots around the stance foot so the foot stays in
+     place.  Any remaining XY drift is subtracted from the root.
+  6. On stance-foot switch the NEW foot's current (already-corrected) world
+     position AND yaw become the anchor — no jump, no fade required.
+  7. During airborne phases (jump) persistent corrections are frozen; on
+     landing the first grounded foot sets a fresh anchor.
+  8. A configurable per-frame decay (``correction_decay``) gradually
+     pulls persistent corrections back toward zero.  Anchors are shifted
+     by the same amount so foot-planting is not destabilised.  This
+     ensures the overall URDF trajectory stays close to the BVH path,
+     which is critical for downstream transfer-learning (BeyondMimic).
 """
 
 import bpy
+import math
 import mathutils
 from bpy.app.handlers import persistent
 from .utils import (
@@ -37,6 +52,24 @@ _AXIS_VECTORS = {
     "Y": mathutils.Vector((0, 1, 0)),
     "Z": mathutils.Vector((0, 0, 1)),
 }
+
+
+def _extract_yaw(matrix) -> float:
+    """
+    Extract yaw (rotation around world Z) from a 4×4 matrix.
+
+    Uses ``atan2`` on the matrix's local X-axis projected onto the
+    world XY-plane.  This avoids Euler-decomposition gimbal
+    instability that occurs when foot pitch approaches ±90°.
+    """
+    q = matrix.to_quaternion()
+    forward = q @ mathutils.Vector((1, 0, 0))
+    return math.atan2(forward.y, forward.x)
+
+
+def _wrap_angle(angle: float) -> float:
+    """Wrap *angle* to the [-π, π] range."""
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def _apply_final_angle(
@@ -123,7 +156,7 @@ def detect_stance_foot(
     scene: bpy.types.Scene,
     bvh_obj: bpy.types.Object,
     settings,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, bool]:
     """
     Determine which BVH foot is the current stance foot (ground anchor).
 
@@ -137,8 +170,12 @@ def detect_stance_foot(
         settings: BVHMappingSettings with foot bone names and jump_threshold.
 
     Returns:
-        (anchor_bone_name, is_anchor_switch)
+        (anchor_bone_name, is_anchor_switch, both_grounded)
         anchor_bone_name is "" when both feet are airborne (jump).
+        both_grounded is True when both feet are in contact with the ground
+        (double-support phase).  During double-support, yaw rotation
+        correction should be suppressed because pivoting around one foot
+        would move the other.
     """
     bvh_floor_offset = scene.get("bvh_floor_offset", 0.0)
 
@@ -197,7 +234,9 @@ def detect_stance_foot(
 
     # else: both feet airborne → anchor_bone_name stays ""
 
-    return anchor_bone_name, is_switch
+    both_grounded = len(active_contacts) >= 2
+
+    return anchor_bone_name, is_switch, both_grounded
 
 
 def apply_joint_retargeting(
@@ -401,11 +440,15 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     Pipeline per frame:
         1. Set URDF root = BVH_delta + persistent_correction + manual offset
         2. Set URDF root rotation from BVH (axis-corrected, damped)
+           + persistent yaw correction
         3. Joint retargeting (FK)
         4. Foot alignment (flatten near ground)
         5. scene update
-        6. Detect stance foot  →  measure URDF foot world position
-        7. Drift = foot_xy − anchor_xy  →  correct root, update persistent_correction
+        6. Detect stance foot  →  measure URDF foot world transform
+        7a. Yaw residual  →  increment persistent yaw, pivot (single-support)
+                              or rotate-in-place (double-support)
+        7b. XY drift      →  correct root, update persistent translation
+        7c. Correction decay → pull persistent offsets toward BVH
         8. Anti-sinking guard
 
     Args:
@@ -434,8 +477,11 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     current_frame = scene.frame_current
     if current_frame == 0 or current_frame == scene.frame_start:
         scene["_persistent_foot_correction"] = mathutils.Vector((0, 0, 0))
+        scene["_persistent_foot_rot_correction"] = mathutils.Quaternion((1, 0, 0, 0))
         scene["_active_anchor_name"] = ""
         scene["_anchor_world_pos_xy"] = None
+        scene["_anchor_world_yaw"] = None
+        scene["_anchor_bvh_yaw"] = None
         scene["_foot_positions"] = {}
 
     # ------------------------------------------------------------------
@@ -488,8 +534,12 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
         "XYZ",
     ).to_quaternion()
 
+    persistent_rot_correction = mathutils.Quaternion(
+        scene.get("_persistent_foot_rot_correction", (1, 0, 0, 0))
+    )
+
     urdf.rotation_mode = "QUATERNION"
-    urdf.rotation_quaternion = off_q @ delta_rot
+    urdf.rotation_quaternion = persistent_rot_correction @ off_q @ delta_rot
 
     # ------------------------------------------------------------------
     # 3.  Joint retargeting  (FK)
@@ -510,19 +560,23 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     # ------------------------------------------------------------------
     # 6.  Detect stance foot  (BVH space)
     # ------------------------------------------------------------------
-    anchor_bone_name, is_anchor_switch = detect_stance_foot(scene, bvh, settings)
+    anchor_bone_name, is_anchor_switch, both_grounded = detect_stance_foot(
+        scene, bvh, settings
+    )
 
     last_anchor = scene.get("_active_anchor_name", "")
     is_first_anchor = anchor_bone_name != "" and last_anchor == ""
 
     # ------------------------------------------------------------------
-    # 7.  Sticky-foot correction
+    # 7.  Sticky-foot correction  (yaw rotation + XY translation)
     # ------------------------------------------------------------------
     if anchor_bone_name:
         urdf_foot_bone = _find_urdf_foot_for_anchor(anchor_bone_name, settings, urdf)
 
         if urdf_foot_bone:
-            foot_world = (urdf.matrix_world @ urdf_foot_bone.matrix).to_translation()
+            foot_world_mat = urdf.matrix_world @ urdf_foot_bone.matrix
+            foot_world = foot_world_mat.to_translation()
+            foot_yaw = _extract_yaw(foot_world_mat)
 
             if is_anchor_switch or is_first_anchor:
                 # ---  New anchor  ---
@@ -530,8 +584,97 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
                 # previous corrections via persistent_correction).
                 # No drift correction this frame → seamless transition.
                 scene["_anchor_world_pos_xy"] = (foot_world.x, foot_world.y)
+                scene["_anchor_world_yaw"] = foot_yaw
 
-            # Retrieve anchor target (may have just been set above)
+                # Also record the BVH foot yaw at anchor time so we can
+                # distinguish intentional rotation from FK error later.
+                bvh_anchor_bone = bvh.pose.bones.get(anchor_bone_name)
+                if bvh_anchor_bone:
+                    bvh_foot_mat = bvh.matrix_world @ bvh_anchor_bone.matrix
+                    scene["_anchor_bvh_yaw"] = _extract_yaw(bvh_foot_mat)
+                else:
+                    scene["_anchor_bvh_yaw"] = None
+
+            # --- 7a.  Rotation correction (yaw / Z-axis) ---
+            #
+            # Persistent, residual-based yaw correction.
+            # Because persistent_rot_correction was already applied in
+            # step 2, the yaw we measure here already includes all
+            # previous corrections.  We therefore only see the RESIDUAL
+            # FK error and increment persistent_rot_correction by that
+            # small amount.  This is self-correcting: when the FK error
+            # vanishes (pose returns to neutral), the residual has the
+            # opposite sign and decays the accumulated correction back
+            # toward identity.  No unbounded growth, no flicker.
+            #
+            # The correction is ALWAYS active (single- AND double-support)
+            # so that yaw drift cannot accumulate in any ground phase.
+            # • Single-support: pivot around the stance foot so it stays
+            #   in place and only the root swings.
+            # • Double-support: rotate root in place (no pivot).  Step 7b
+            #   then re-pins the anchor foot via XY translation.  The
+            #   non-anchor foot may shift minimally, which is acceptable
+            #   for the typically short double-support phases.
+            #
+            # Yaw is extracted via atan2 (gimbal-safe) and differences
+            # are wrapped to [-π, π] to avoid 2π jumps.
+            anchor_yaw = scene.get("_anchor_world_yaw", None)
+            if anchor_yaw is not None:
+                # How much the URDF foot yaw changed since anchor
+                urdf_yaw_change = _wrap_angle(foot_yaw - anchor_yaw)
+
+                # How much the BVH foot yaw changed since anchor
+                # (= intentional rotation from the motion-capture data)
+                bvh_yaw_change = 0.0
+                anchor_bvh_yaw = scene.get("_anchor_bvh_yaw", None)
+                if anchor_bvh_yaw is not None:
+                    bvh_anchor_bone = bvh.pose.bones.get(anchor_bone_name)
+                    if bvh_anchor_bone:
+                        cur_bvh_yaw = _extract_yaw(
+                            bvh.matrix_world @ bvh_anchor_bone.matrix
+                        )
+                        bvh_yaw_change = _wrap_angle(cur_bvh_yaw - anchor_bvh_yaw)
+
+                # Residual FK error (what remains after persistent correction)
+                yaw_residual = _wrap_angle(urdf_yaw_change - bvh_yaw_change)
+
+                if abs(yaw_residual) > 1e-6:
+                    yaw_fix_q = mathutils.Quaternion((0, 0, 1), -yaw_residual)
+
+                    # --- Rotate root orientation ---
+                    urdf.rotation_quaternion = yaw_fix_q @ urdf.rotation_quaternion
+
+                    if not both_grounded:
+                        # --- Single-support: Pivot around stance foot ---
+                        root_pos = urdf.location.copy()
+                        pivot = mathutils.Vector(
+                            (foot_world.x, foot_world.y, root_pos.z)
+                        )
+                        offset_from_pivot = root_pos - pivot
+                        rotated_offset = yaw_fix_q @ offset_from_pivot
+                        urdf.location = pivot + rotated_offset
+
+                        # Persist pivot-induced position shift
+                        loc_shift = rotated_offset - offset_from_pivot
+                        persistent_correction += loc_shift
+                        scene["_persistent_foot_correction"] = persistent_correction
+                    # else: double-support — rotate in place, 7b re-pins
+
+                    # Accumulate into persistent correction for next frame
+                    persistent_rot_correction = yaw_fix_q @ persistent_rot_correction
+                    scene["_persistent_foot_rot_correction"] = persistent_rot_correction
+
+                    # Scene must update after rotation change so that
+                    # foot position reflects the new orientation before
+                    # we measure XY drift.
+                    bpy.context.view_layer.update()
+
+                    # Re-measure foot position after rotation correction
+                    foot_world = (
+                        urdf.matrix_world @ urdf_foot_bone.matrix
+                    ).to_translation()
+
+            # --- 7b.  Translation correction (XY) ---
             anchor_xy = scene.get("_anchor_world_pos_xy", None)
 
             if anchor_xy is not None:
@@ -553,10 +696,84 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
 
     else:
         # Both feet airborne (jump) — freeze correction, clear anchor.
-        # persistent_correction is NOT modified, so the offset from the
-        # last stance phase is preserved and landing is seamless.
+        # persistent corrections (translation + rotation) are NOT modified,
+        # so the offsets from the last stance phase are preserved and
+        # landing is seamless.
         scene["_active_anchor_name"] = ""
         scene["_anchor_world_pos_xy"] = None
+        scene["_anchor_world_yaw"] = None
+        scene["_anchor_bvh_yaw"] = None
+
+    # ------------------------------------------------------------------
+    # 7c.  Correction decay — pull persistent offsets toward BVH
+    #
+    # Without decay the persistent corrections accumulate without
+    # bound, causing the URDF root to drift away from the BVH
+    # trajectory.  A small per-frame decay acts as a leaky
+    # integrator: foot-planting adds corrections, decay removes
+    # them.  The anchors are shifted by the same amount so the
+    # foot-planting loop does not immediately re-introduce what
+    # was decayed — the net effect is a smooth pull back toward
+    # the original BVH motion path.
+    # ------------------------------------------------------------------
+    target_hz = scene.render.fps if scene.render.fps > 0 else 120.0
+    _REF_FPS = 120.0
+    # UI value is a readable percentage-like number (default 0.05).
+    # Divide by 10 to obtain the actual per-frame rate at 120 FPS
+    # (0.05 → 0.005 per frame).
+    raw_decay = settings.correction_decay / 10.0
+    # FPS-independent decay: the configured rate is defined at 120 FPS.
+    # At other frame-rates we adjust so the per-second decay stays equal.
+    #   (1 - adjusted)^fps == (1 - raw_decay)^120
+    #   adjusted = 1 - (1 - raw_decay)^(120 / fps)
+    if raw_decay >= 0.1:
+        decay_rate = 1.0
+    elif raw_decay > 0.0:
+        decay_rate = 1.0 - (1.0 - raw_decay) ** (_REF_FPS / target_hz)
+    else:
+        decay_rate = 0.0
+    if decay_rate > 0.0:
+        # Re-read (step 7 may have modified them)
+        persistent_correction = mathutils.Vector(
+            scene.get("_persistent_foot_correction", (0, 0, 0))
+        )
+        persistent_rot_correction = mathutils.Quaternion(
+            scene.get("_persistent_foot_rot_correction", (1, 0, 0, 0))
+        )
+
+        # --- Translation decay (XY only, Z handled by anti-sinking) ---
+        decay_x = persistent_correction.x * decay_rate
+        decay_y = persistent_correction.y * decay_rate
+        persistent_correction.x -= decay_x
+        persistent_correction.y -= decay_y
+
+        anchor_xy = scene.get("_anchor_world_pos_xy", None)
+        if anchor_xy is not None:
+            scene["_anchor_world_pos_xy"] = (
+                anchor_xy[0] - decay_x,
+                anchor_xy[1] - decay_y,
+            )
+
+        # --- Rotation decay (yaw around Z) ---
+        identity_q = mathutils.Quaternion((1, 0, 0, 0))
+        old_yaw = 2.0 * math.atan2(
+            persistent_rot_correction.z, persistent_rot_correction.w
+        )
+        persistent_rot_correction = persistent_rot_correction.slerp(
+            identity_q, decay_rate
+        )
+        new_yaw = 2.0 * math.atan2(
+            persistent_rot_correction.z, persistent_rot_correction.w
+        )
+        yaw_removed = old_yaw - new_yaw
+
+        anchor_yaw = scene.get("_anchor_world_yaw", None)
+        if anchor_yaw is not None:
+            scene["_anchor_world_yaw"] = anchor_yaw - yaw_removed
+
+        # Store decayed values
+        scene["_persistent_foot_correction"] = persistent_correction
+        scene["_persistent_foot_rot_correction"] = persistent_rot_correction
 
     # ------------------------------------------------------------------
     # 8.  Anti-sinking guard

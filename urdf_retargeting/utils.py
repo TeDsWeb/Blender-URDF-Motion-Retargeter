@@ -84,17 +84,19 @@ def apply_continuity_correction(
     When rotations wrap around from +π to -π (or vice versa), this function
     adjusts the current value to maintain smooth continuity with the previous value.
 
-    Also includes a sanity check to reject unrealistic jumps that indicate
-    extraction instability (e.g., from quaternion singularities).
+    For jumps that exceed *max_jump* after unwrapping, the function moves
+    toward the target at *max_jump* rate instead of hard-rejecting.  This
+    prevents joints from getting permanently stuck when a legitimate fast
+    motion triggers the sanity check, while still damping true extraction
+    artifacts (quaternion singularity flips).
 
     Args:
         current_value: The current angle value (in radians).
         previous_value: The previous angle value (in radians).
-        max_jump: Maximum allowed jump in radians; larger jumps are rejected (default: 1.5 rad ≈ 86°).
+        max_jump: Maximum allowed step per frame in radians (default: 1.5 rad ≈ 86°).
 
     Returns:
         The corrected angle that maintains continuity with the previous value.
-        Returns previous_value if a discontinuity larger than max_jump is detected.
     """
     diff = current_value - previous_value
 
@@ -103,9 +105,11 @@ def apply_continuity_correction(
     elif diff < -math.pi:
         current_value = current_value + 2 * math.pi
 
-    # Sanity check: reject unrealistic jumps that indicate extraction instability
-    if abs(current_value - previous_value) > max_jump:
-        return previous_value
+    # Rate-limit: approach target at max_jump speed instead of hard reject
+    clamped_diff = current_value - previous_value
+    if abs(clamped_diff) > max_jump:
+        direction = 1.0 if clamped_diff > 0 else -1.0
+        return previous_value + direction * max_jump
 
     return current_value
 

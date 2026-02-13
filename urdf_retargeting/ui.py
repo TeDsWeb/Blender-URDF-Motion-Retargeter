@@ -166,6 +166,7 @@ class PANEL_FootConfiguration(Panel):
         box.prop(settings, "jump_threshold")
         box.prop(settings, "foot_flattening_height")
         box.prop(settings, "foot_flattening_strength")
+        box.prop(settings, "correction_decay", slider=True)
 
 
 class PANEL_BoneMapping(Panel):
