@@ -150,7 +150,7 @@ class BVHMappingSettings(PropertyGroup):
         description=(
             "Decay percentage for foot-planting corrections "
             "(reference: 120 FPS). Value is interpreted as a "
-            "percentage: 0.05 ≈ 0.05 %% per frame at 120 FPS. "
+            "percentage: 0.05 ≈ 0.5 % per frame at 120 FPS. "
             "Automatically scaled to the scene frame-rate so the "
             "effective decay per second stays constant. "
             "Pulls the URDF root back toward the BVH trajectory "

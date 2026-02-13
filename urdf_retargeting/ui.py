@@ -111,16 +111,16 @@ class PANEL_MotionOptions(Panel):
         # Root motion control
         box = layout.box()
         box.label(text="Root Motion", icon="ARMATURE_DATA")
-        box.prop(settings, "root_scale")
+        box.prop(settings, "root_scale", slider=True)
         box.prop(settings, "location_offset")
         box.prop(settings, "rotation_offset")
 
         # Motion smoothing
         box = layout.box()
         box.label(text="Smoothing", icon="MOD_SMOOTH")
-        box.prop(settings, "bvh_smoothing")
-        box.prop(settings, "joint_smoothing")
-        box.prop(settings, "max_jump_threshold")
+        box.prop(settings, "bvh_smoothing", slider=True)
+        box.prop(settings, "joint_smoothing", slider=True)
+        box.prop(settings, "max_jump_threshold", slider=True)
 
 
 class PANEL_FootConfiguration(Panel):
@@ -163,9 +163,9 @@ class PANEL_FootConfiguration(Panel):
         # Foot contact parameters
         box = layout.box()
         box.label(text="Foot Contact", icon="SNAP_FACE_CENTER")
-        box.prop(settings, "jump_threshold")
-        box.prop(settings, "foot_flattening_height")
-        box.prop(settings, "foot_flattening_strength")
+        box.prop(settings, "jump_threshold", slider=True)
+        box.prop(settings, "foot_flattening_height", slider=True)
+        box.prop(settings, "foot_flattening_strength", slider=True)
         box.prop(settings, "correction_decay", slider=True)
 
 

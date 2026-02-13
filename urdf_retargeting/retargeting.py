@@ -719,8 +719,8 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     target_hz = scene.render.fps if scene.render.fps > 0 else 120.0
     _REF_FPS = 120.0
     # UI value is a readable percentage-like number (default 0.05).
-    # Divide by 10 to obtain the actual per-frame rate at 120 FPS
-    # (0.05 → 0.005 per frame).
+    # Divide by 100 to obtain the actual per-frame rate at 120 FPS
+    # (0.05 → 0.005 per frame → 0.5% decay per frame).
     raw_decay = settings.correction_decay / 10.0
     # FPS-independent decay: the configured rate is defined at 120 FPS.
     # At other frame-rates we adjust so the per-second decay stays equal.
