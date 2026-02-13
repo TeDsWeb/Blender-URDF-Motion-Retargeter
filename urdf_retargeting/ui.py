@@ -291,7 +291,7 @@ class PANEL_ApplyAndExport(Panel):
         row.prop(settings, "export_from_frame", text="From")
         row.prop(settings, "export_to_frame", text="To")
 
-        op = box.operator("object.export_beyond_mimic", text="Export to Beyond Mimic")
+        op = box.operator("object.export_beyond_mimic", text="Export to BeyondMimic")
         # pass current UI settings as defaults to the operator so file-browser shows them
         op.export_from_frame = settings.export_from_frame
         op.export_to_frame = settings.export_to_frame
