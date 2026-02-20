@@ -279,8 +279,6 @@ class OT_ApplyBVHMapping(Operator):
                 settings.export_from_frame = scene.frame_start
                 settings.export_to_frame = scene.frame_end
 
-            # Default target_hz to scene FPS so 1:1 export requires no resampling
-            settings.target_hz = scene.render.fps
         except Exception:
             # Defensive: if properties are not present or writing fails, ignore
             pass
