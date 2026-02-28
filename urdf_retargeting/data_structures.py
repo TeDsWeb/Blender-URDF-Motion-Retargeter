@@ -66,6 +66,22 @@ class BVHMappingItem(PropertyGroup):
     )
 
 
+class DefaultPoseJoint(PropertyGroup):
+    """Editable default-pose angle for one URDF joint."""
+
+    joint_name: StringProperty(
+        name="Joint Name",
+        description="URDF joint name",
+        default="",
+    )
+    angle: FloatProperty(
+        name="Angle",
+        description="Default angle for this joint used in export blend phases",
+        subtype="ANGLE",
+        default=0.0,
+    )
+
+
 class BVHMappingSettings(PropertyGroup):
     """Master settings for BVH-to-URDF retargeting."""
 
@@ -200,6 +216,53 @@ class BVHMappingSettings(PropertyGroup):
     export_to_frame: IntProperty(
         name="Export To Frame",
         description="Last frame to include when exporting (scene frame if 0)",
+        default=0,
+        min=0,
+    )
+    export_blend_in_seconds: FloatProperty(
+        name="Blend In (s)",
+        description="Duration in seconds to blend from default pose into the exported motion",
+        default=0.0,
+        min=0.0,
+    )
+    export_blend_out_seconds: FloatProperty(
+        name="Blend Out (s)",
+        description="Duration in seconds to blend from exported motion back to default pose",
+        default=0.0,
+        min=0.0,
+    )
+    export_end_pose_hold_seconds: FloatProperty(
+        name="End Pose Hold (s)",
+        description="Duration in seconds to hold the final exported pose at the end",
+        default=0.0,
+        min=0.0,
+    )
+    use_custom_default_pose: BoolProperty(
+        name="Use Custom Default Pose",
+        description="Use custom default pose settings for export blend-in/out instead of calibrated neutral pose",
+        default=False,
+    )
+    default_pose_root_position: FloatVectorProperty(
+        name="Default Root Position",
+        description="Custom default root position (world space)",
+        subtype="TRANSLATION",
+        size=3,
+        default=(0.0, 0.0, 0.0),
+    )
+    default_pose_root_rotation: FloatVectorProperty(
+        name="Default Root Rotation",
+        description="Custom default root rotation (Euler XYZ)",
+        subtype="EULER",
+        size=3,
+        default=(0.0, 0.0, 0.0),
+    )
+    default_pose_joints: CollectionProperty(
+        type=DefaultPoseJoint,
+        description="Editable default joint angles used for export blend phases",
+    )
+    default_pose_active_index: IntProperty(
+        name="Default Pose Joint Index",
+        description="Active default-pose joint index in UI",
         default=0,
         min=0,
     )

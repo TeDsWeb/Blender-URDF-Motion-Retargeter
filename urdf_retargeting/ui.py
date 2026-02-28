@@ -76,6 +76,26 @@ class UL_URDFBoneList(UIList):
         row.prop(item, "neutral_offset", text="")
 
 
+class UL_DefaultPoseJointList(UIList):
+    """List of editable default-pose joint angles."""
+
+    def draw_item(
+        self,
+        context,
+        layout,
+        data,
+        item,
+        icon,
+        active_data,
+        active_propname,
+        index,
+    ):
+        """Draw a single default-pose joint angle row."""
+        row = layout.row(align=True)
+        row.label(text=item.joint_name or "<joint>")
+        row.prop(item, "angle", text="")
+
+
 class PANEL_RigSelection(Panel):
     """Panel for selecting URDF and BVH rigs."""
 
@@ -290,11 +310,61 @@ class PANEL_ApplyAndExport(Panel):
         row = box.row(align=True)
         row.prop(settings, "export_from_frame", text="From")
         row.prop(settings, "export_to_frame", text="To")
+        row = box.row(align=True)
+        row.prop(settings, "export_blend_in_seconds", text="Blend In (s)")
+        row.prop(settings, "export_blend_out_seconds", text="Blend Out (s)")
+        box.prop(settings, "export_end_pose_hold_seconds", text="End Pose Hold (s)")
+        box.prop(settings, "use_custom_default_pose", text="Use Custom Default Pose")
+
+        if settings.use_custom_default_pose:
+            row = box.row(align=True)
+            row.prop(
+                settings,
+                "default_pose_root_rotation",
+                index=0,
+                text="Default Root Roll",
+            )
+            row.prop(
+                settings,
+                "default_pose_root_rotation",
+                index=1,
+                text="Default Root Pitch",
+            )
+
+            row = box.row(align=True)
+            row.operator(
+                "object.capture_default_pose_from_current",
+                text="Capture Current Pose",
+                icon="IMPORT",
+            )
+            row.operator(
+                "object.sync_default_pose_joints",
+                text="Sync Joint List",
+                icon="FILE_REFRESH",
+            )
+            row.operator(
+                "object.reset_default_pose",
+                text="Reset Default Pose",
+                icon="LOOP_BACK",
+            )
+
+            box.template_list(
+                "UL_DefaultPoseJointList",
+                "",
+                settings,
+                "default_pose_joints",
+                settings,
+                "default_pose_active_index",
+                rows=5,
+            )
 
         op = box.operator("object.export_beyond_mimic", text="Export BeyondMimic")
         # pass current UI settings as defaults to the operator so file-browser shows them
         op.export_from_frame = settings.export_from_frame
         op.export_to_frame = settings.export_to_frame
+        op.default_pose_blend_in_seconds = settings.export_blend_in_seconds
+        op.default_pose_blend_out_seconds = settings.export_blend_out_seconds
+        op.end_pose_hold_seconds = settings.export_end_pose_hold_seconds
 
         # Import section
         box = layout.box()

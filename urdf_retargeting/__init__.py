@@ -33,10 +33,16 @@ from bpy.types import Scene
 from bpy.props import PointerProperty
 
 # Import modules and register classes
-from .data_structures import BVHMappingBone, BVHMappingItem, BVHMappingSettings
+from .data_structures import (
+    BVHMappingBone,
+    BVHMappingItem,
+    DefaultPoseJoint,
+    BVHMappingSettings,
+)
 from .ui import (
     UL_BVHMappingList,
     UL_URDFBoneList,
+    UL_DefaultPoseJointList,
     PANEL_RigSelection,
     PANEL_MotionOptions,
     PANEL_FootConfiguration,
@@ -53,7 +59,12 @@ from .operators import (
     IMPORT_OT_urdf_humanoid,
     menu_func_import,
 )
-from .export import OT_ExportBeyondMimic
+from .export import (
+    OT_ExportBeyondMimic,
+    OT_CaptureDefaultPoseFromCurrent,
+    OT_ResetDefaultPose,
+    OT_SyncDefaultPoseJoints,
+)
 from .import_csv import OT_ImportBeyondMimic
 from .retargeting import retarget_frame
 
@@ -63,10 +74,12 @@ classes = [
     # Data structures
     BVHMappingBone,
     BVHMappingItem,
+    DefaultPoseJoint,
     BVHMappingSettings,
     # UI
     UL_BVHMappingList,
     UL_URDFBoneList,
+    UL_DefaultPoseJointList,
     PANEL_RigSelection,
     PANEL_MotionOptions,
     PANEL_FootConfiguration,
@@ -80,6 +93,9 @@ classes = [
     OT_RemoveBVHBone,
     OT_ClearScene,
     IMPORT_OT_urdf_humanoid,
+    OT_CaptureDefaultPoseFromCurrent,
+    OT_SyncDefaultPoseJoints,
+    OT_ResetDefaultPose,
     OT_ExportBeyondMimic,
     OT_ImportBeyondMimic,
 ]
