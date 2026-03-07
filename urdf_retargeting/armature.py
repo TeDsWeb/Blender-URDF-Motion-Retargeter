@@ -212,3 +212,61 @@ def bind_meshes(
                 obj.matrix_world = link_mats[link_name] @ origin_to_matrix(
                     vis.xyz, vis.rpy
                 )
+
+                # Apply material/color/texture if provided in URDFVisual
+                try:
+                    mat_name = (
+                        vis.material_name
+                        if vis.material_name
+                        else f"{link_name}_mat_{idx}"
+                    )
+
+                    # Create or reuse a material
+                    mat = bpy.data.materials.get(mat_name)
+                    if mat is None:
+                        mat = bpy.data.materials.new(mat_name)
+
+                    mat.use_nodes = True
+                    nodes = mat.node_tree.nodes
+                    links = mat.node_tree.links
+
+                    # Ensure Principled BSDF exists
+                    bsdf = nodes.get("Principled BSDF")
+                    if bsdf is None:
+                        bsdf = nodes.new(type="ShaderNodeBsdfPrincipled")
+
+                    # Apply color (RGBA) if present
+                    if vis.color is not None and len(vis.color) >= 3:
+                        # URDF color values are typically 0..1
+                        r, g, b = vis.color[0], vis.color[1], vis.color[2]
+                        a = vis.color[3] if len(vis.color) > 3 else 1.0
+                        bsdf.inputs["Base Color"].default_value = (r, g, b, 1.0)
+                        bsdf.inputs["Alpha"].default_value = a
+                        if a < 1.0:
+                            mat.blend_method = "BLEND"
+
+                    # Apply texture if present and available on disk
+                    if vis.texture:
+                        tex_raw = vis.texture.replace("package://", "")
+                        tex_path = os.path.normpath(os.path.join(base_path, tex_raw))
+                        if os.path.exists(tex_path):
+                            try:
+                                img = bpy.data.images.load(tex_path)
+                                tex_node = nodes.new(type="ShaderNodeTexImage")
+                                tex_node.image = img
+                                # Connect texture color to Base Color
+                                links.new(
+                                    tex_node.outputs["Color"], bsdf.inputs["Base Color"]
+                                )
+                            except Exception:
+                                # Loading image failed; ignore and continue
+                                pass
+
+                    # Assign material to object (replace first slot)
+                    if obj.data.materials:
+                        obj.data.materials[0] = mat
+                    else:
+                        obj.data.materials.append(mat)
+                except Exception:
+                    # Don't fail the whole import for material issues
+                    pass

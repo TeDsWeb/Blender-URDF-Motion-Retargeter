@@ -6,24 +6,44 @@ along with XML parsing functionality to load URDF files.
 """
 
 import xml.etree.ElementTree as ET
+from typing import Optional
+
 from .utils import parse_float_list
 
 
 class URDFVisual:
-    """Represents a visual element (mesh) in a URDF link."""
+    """Represents a visual element (mesh) in a URDF link, including material.
 
-    def __init__(self, xyz: list[float], rpy: list[float], mesh: str):
+    Stores transform (origin), mesh filename and optional material properties
+    such as a material name, color RGBA and a texture filename.
+    """
+
+    def __init__(
+        self,
+        xyz: list[float],
+        rpy: list[float],
+        mesh: Optional[str],
+        material_name: Optional[str] = None,
+        color: Optional[list[float]] = None,
+        texture: Optional[str] = None,
+    ):
         """
         Initialize a URDF visual element.
 
         Args:
             xyz: Translation of the visual [x, y, z].
             rpy: Rotation of the visual (roll, pitch, yaw) in radians.
-            mesh: Path to the mesh file.
+            mesh: Path to the mesh file (may be None).
+            material_name: Optional name of the material from URDF.
+            color: Optional RGBA color list [r,g,b,a].
+            texture: Optional texture filename.
         """
         self.xyz = xyz
         self.rpy = rpy
         self.mesh = mesh
+        self.material_name = material_name
+        self.color = color
+        self.texture = texture
 
 
 class URDFLink:
@@ -142,8 +162,25 @@ def parse_urdf(path: str) -> URDFRobot:
             mesh_el = geom.find("mesh") if geom is not None else None
             mesh = mesh_el.attrib.get("filename") if mesh_el is not None else None
 
+            # Parse material (optional) - color RGBA and texture filename
+            material_name = None
+            color = None
+            texture = None
+            material_el = vis_el.find("material")
+            if material_el is not None:
+                material_name = material_el.attrib.get("name")
+                color_el = material_el.find("color")
+                if color_el is not None and "rgba" in color_el.attrib:
+                    color = parse_float_list(color_el.attrib.get("rgba"), 4)
+                    print(f"Parsed color for material '{material_name}': {color}")
+                texture_el = material_el.find("texture")
+                if texture_el is not None:
+                    texture = texture_el.attrib.get("filename")
+
             if mesh:
-                link.visuals.append(URDFVisual(xyz, rpy, mesh))
+                link.visuals.append(
+                    URDFVisual(xyz, rpy, mesh, material_name, color, texture)
+                )
 
         robot.links[link.name] = link
 
