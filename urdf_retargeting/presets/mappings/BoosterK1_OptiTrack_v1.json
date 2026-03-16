@@ -1,0 +1,22 @@
+{
+  "format": "urdf_retargeting_mapping_v1",
+  "metadata": {
+    "preset_name": "BoosterK1_OptiTrack_v1",
+    "robot_profile": "Booster K1",
+    "mocap_profile": "OptiTrack BVH Rig",
+    "urdf_rig_name": "",
+    "bvh_rig_name": ""
+  },
+  "settings": {
+    "retargeting_method": "HYBRID",
+    "hybrid_adaptive_ik": true,
+    "hybrid_ik_blend": 0.5,
+    "hybrid_min_ik_blend": 0.2,
+    "hybrid_error_low": 0.01,
+    "hybrid_error_high": 0.08,
+    "hybrid_realtime_guard": true,
+    "hybrid_min_iterations": 4
+  },
+  "mappings": [],
+  "kinematic_chains": []
+}

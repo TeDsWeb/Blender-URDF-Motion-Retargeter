@@ -1,4 +1,4 @@
-"""
+﻿"""
 User interface panels and lists for BVH-to-URDF retargeting.
 
 Provides multiple organized panels and lists for bone mapping configuration,
@@ -8,24 +8,29 @@ motion options, and export parameters.
 from bpy.types import Panel, UIList
 
 
+def _draw_advanced_toggle(layout, data, prop_name, label="Advanced"):
+    """Draw a compact disclosure-style toggle for optional advanced settings."""
+    is_open = getattr(data, prop_name)
+    row = layout.row(align=True)
+    row.prop(
+        data,
+        prop_name,
+        text=label,
+        emboss=False,
+        icon="TRIA_DOWN" if is_open else "TRIA_RIGHT",
+    )
+    return is_open
+
+
 class UL_BVHMappingList(UIList):
     """List of BVH-to-URDF bone mappings."""
 
     def draw_item(
-        self,
-        context,
-        layout,
-        data,
-        item,
-        icon,
-        active_data,
-        active_propname,
-        index,
+        self, context, layout, data, item, icon, active_data, active_propname, index
     ):
         """Draw a single mapping item in the list."""
         row = layout.row(align=True)
         row.label(text=f"BVH: {item.bvh_bone_name}")
-
         count = len(item.urdf_bones)
         if count > 0:
             row.label(text=f"URDF: {count}")
@@ -38,38 +43,18 @@ class UL_URDFBoneList(UIList):
     """List of URDF bones controlled by a BVH bone."""
 
     def draw_item(
-        self,
-        context,
-        layout,
-        data,
-        item,
-        icon,
-        active_data,
-        active_propname,
-        index,
+        self, context, layout, data, item, icon, active_data, active_propname, index
     ):
         """Draw a single URDF bone mapping item."""
         urdf_obj = context.scene.urdf_rig_object
         row = layout.row(align=True)
-
-        # Show error icon if velocity limit was exceeded
         if urdf_obj and item.urdf_bone_name in urdf_obj.pose.bones:
             ub = urdf_obj.pose.bones[item.urdf_bone_name]
             if ub.get("is_velocity_limited"):
                 row.label(text="", icon="ERROR")
                 row.alert = True
-
-        # URDF bone search property
         if urdf_obj:
-            row.prop_search(
-                item,
-                "urdf_bone_name",
-                urdf_obj.pose,
-                "bones",
-                text="",
-            )
-
-        # Configuration properties
+            row.prop_search(item, "urdf_bone_name", urdf_obj.pose, "bones", text="")
         row.prop(item, "source_axis", text="")
         row.prop(item, "sign", text="")
         row.prop(item, "invert_alignment", text="")
@@ -80,15 +65,7 @@ class UL_DefaultPoseJointList(UIList):
     """List of editable default-pose joint angles."""
 
     def draw_item(
-        self,
-        context,
-        layout,
-        data,
-        item,
-        icon,
-        active_data,
-        active_propname,
-        index,
+        self, context, layout, data, item, icon, active_data, active_propname, index
     ):
         """Draw a single default-pose joint angle row."""
         row = layout.row(align=True)
@@ -100,15 +77,7 @@ class UL_KinematicChainList(UIList):
     """List of configured kinematic target chains."""
 
     def draw_item(
-        self,
-        context,
-        layout,
-        data,
-        item,
-        icon,
-        active_data,
-        active_propname,
-        index,
+        self, context, layout, data, item, icon, active_data, active_propname, index
     ):
         """Draw a single kinematic chain row."""
         row = layout.row(align=True)
@@ -127,13 +96,12 @@ class PANEL_RigSelection(Panel):
     bl_idname = "VIEW3D_PT_urdf_rig_selection"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "BVH → URDF Retargeting"
+    bl_category = "BVH -> URDF Retargeting"
 
     def draw(self, context):
         """Draw rig selection panel."""
         layout = self.layout
         s = context.scene
-
         layout.prop(s, "urdf_rig_object", text="URDF Rig")
         layout.prop(s, "bvh_rig_object", text="BVH Rig")
 
@@ -145,49 +113,88 @@ class PANEL_MotionOptions(Panel):
     bl_idname = "VIEW3D_PT_urdf_motion_options"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "BVH → URDF Retargeting"
+    bl_category = "BVH -> URDF Retargeting"
 
     def draw(self, context):
         """Draw motion options panel."""
         layout = self.layout
         settings = context.scene.bvh_mapping_settings
 
-        layout.prop(settings, "retargeting_method")
+        # Keep old scene files compatible but expose one production path in UI.
+        if settings.retargeting_method != "HYBRID":
+            settings.retargeting_method = "HYBRID"
+        layout.label(text="Retargeting: Hybrid FK + IK", icon="INFO")
 
         # Root motion control
         box = layout.box()
         box.label(text="Root Motion", icon="ARMATURE_DATA")
         box.prop(settings, "root_scale", slider=True)
-        box.prop(settings, "location_offset")
-        box.prop(settings, "rotation_offset")
+        if _draw_advanced_toggle(box, settings, "ui_show_root_advanced"):
+            box.prop(settings, "location_offset")
+            box.prop(settings, "rotation_offset")
 
-        # Motion smoothing
+        # BVH source smoothing (always visible)
         box = layout.box()
         box.label(text="Smoothing", icon="MOD_SMOOTH")
         box.prop(settings, "bvh_smoothing", slider=True)
-        if settings.retargeting_method == "ANGLE":
-            box.prop(settings, "joint_smoothing", slider=True)
-            box.prop(settings, "max_jump_threshold", slider=True)
-        elif settings.retargeting_method == "KINEMATIC":
-            box.prop(settings, "ik_target_smoothing", slider=True)
-            box.prop(settings, "ik_iterations")
-            box.prop(settings, "ik_tolerance")
-            box.prop(settings, "ik_max_step_angle", slider=True)
-            box.prop(settings, "ik_target_scale", slider=True)
-            box.prop(settings, "ik_proportion_blend", slider=True)
-            box.prop(settings, "ik_ground_lock_strength", slider=True)
-        else:
-            box.prop(settings, "joint_smoothing", slider=True)
-            box.prop(settings, "max_jump_threshold", slider=True)
-            box.separator()
-            box.prop(settings, "hybrid_ik_blend", slider=True)
-            box.prop(settings, "ik_target_smoothing", slider=True)
-            box.prop(settings, "ik_iterations")
-            box.prop(settings, "ik_tolerance")
-            box.prop(settings, "ik_max_step_angle", slider=True)
-            box.prop(settings, "ik_target_scale", slider=True)
-            box.prop(settings, "ik_proportion_blend", slider=True)
-            box.prop(settings, "ik_ground_lock_strength", slider=True)
+
+        # --- HYBRID: FK Baseline ---
+        fk_box = layout.box()
+        fk_box.label(text="FK Baseline", icon="BONE_DATA")
+        fk_box.prop(settings, "joint_smoothing", slider=True)
+        if _draw_advanced_toggle(fk_box, settings, "ui_show_fk_advanced"):
+            fk_box.prop(settings, "max_jump_threshold", slider=True)
+
+        # --- HYBRID: IK Correction ---
+        ik_box = layout.box()
+        ik_box.label(text="IK Correction", icon="CON_KINEMATIC")
+        ik_box.prop(settings, "hybrid_ik_blend", slider=True)
+        ik_box.prop(settings, "ik_target_smoothing", slider=True)
+        ik_box.prop(settings, "ik_joint_smoothing", slider=True)
+        if _draw_advanced_toggle(ik_box, settings, "ui_show_ik_advanced"):
+            ik_box.prop(settings, "hybrid_adaptive_ik")
+            if settings.hybrid_adaptive_ik:
+                sub = ik_box.column(align=True)
+                sub.prop(settings, "hybrid_min_ik_blend", slider=True)
+                sub.prop(settings, "hybrid_error_low")
+                sub.prop(settings, "hybrid_error_high")
+                sub.prop(settings, "hybrid_blend_smoothing", slider=True)
+            ik_box.separator()
+            ik_box.prop(settings, "ik_micro_deadzone", slider=True)
+            ik_box.prop(settings, "ik_iterations")
+            ik_box.prop(settings, "ik_tolerance")
+            ik_box.prop(settings, "ik_max_step_angle", slider=True)
+            ik_box.prop(settings, "ik_target_scale", slider=True)
+            ik_box.prop(settings, "ik_proportion_blend", slider=True)
+            ik_box.prop(settings, "ik_ground_lock_strength", slider=True)
+
+        # --- HYBRID: Performance ---
+        perf_box = layout.box()
+        perf_box.label(text="Performance", icon="SORTTIME")
+        perf_box.prop(settings, "hybrid_realtime_guard")
+        if _draw_advanced_toggle(
+            perf_box,
+            settings,
+            "ui_show_performance_advanced",
+        ):
+            if settings.hybrid_realtime_guard:
+                perf_box.prop(settings, "hybrid_min_iterations")
+            perf_box.prop(settings, "hybrid_ik_frame_skip")
+
+        # --- Telemetry ---
+        avg_ms = context.scene.get("_retarget_ms_ema", None)
+        if avg_ms is not None:
+            perf_box.separator()
+            perf_box.label(text=f"Retarget Avg: {avg_ms:.2f} ms/frame", icon="TIME")
+        ik_ms = context.scene.get("_retarget_ms_ik", None)
+        if ik_ms is not None:
+            perf_box.label(text=f"IK Stage: {ik_ms:.2f} ms", icon="CON_KINEMATIC")
+        fk_ms = context.scene.get("_retarget_ms_fk", None)
+        if fk_ms is not None:
+            perf_box.label(text=f"FK Stage: {fk_ms:.2f} ms", icon="BONE_DATA")
+        sink_ms = context.scene.get("_retarget_ms_sink", None)
+        if sink_ms is not None:
+            perf_box.label(text=f"Anti-Sink: {sink_ms:.2f} ms", icon="EMPTY_ARROWS")
 
 
 class PANEL_FootConfiguration(Panel):
@@ -197,7 +204,7 @@ class PANEL_FootConfiguration(Panel):
     bl_idname = "VIEW3D_PT_urdf_foot_config"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "BVH → URDF Retargeting"
+    bl_category = "BVH -> URDF Retargeting"
 
     def draw(self, context):
         """Draw foot configuration panel."""
@@ -209,31 +216,25 @@ class PANEL_FootConfiguration(Panel):
             layout.label(text="Select BVH Rig first", icon="INFO")
             return
 
-        # Foot bone selection
         box = layout.box()
         box.label(text="Foot Bones", icon="BONE_DATA")
         box.prop_search(
-            settings,
-            "foot_l_name",
-            s.bvh_rig_object.pose,
-            "bones",
-            text="Left Foot",
+            settings, "foot_l_name", s.bvh_rig_object.pose, "bones", text="Left Foot"
         )
         box.prop_search(
-            settings,
-            "foot_r_name",
-            s.bvh_rig_object.pose,
-            "bones",
-            text="Right Foot",
+            settings, "foot_r_name", s.bvh_rig_object.pose, "bones", text="Right Foot"
         )
 
-        # Foot contact parameters
         box = layout.box()
         box.label(text="Foot Contact", icon="SNAP_FACE_CENTER")
         box.prop(settings, "jump_threshold", slider=True)
-        box.prop(settings, "foot_flattening_height", slider=True)
         box.prop(settings, "foot_flattening_strength", slider=True)
-        box.prop(settings, "correction_decay", slider=True)
+        if _draw_advanced_toggle(box, settings, "ui_show_foot_advanced"):
+            box.prop(settings, "foot_contact_hysteresis", slider=True)
+            box.prop(settings, "foot_flattening_height", slider=True)
+            box.prop(settings, "foot_pin_xy_max_step", slider=True)
+            box.prop(settings, "foot_pin_yaw_max_step", slider=True)
+            box.prop(settings, "correction_decay", slider=True)
 
 
 class PANEL_BoneMapping(Panel):
@@ -243,21 +244,13 @@ class PANEL_BoneMapping(Panel):
     bl_idname = "VIEW3D_PT_urdf_bone_mapping"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "BVH → URDF Retargeting"
+    bl_category = "BVH -> URDF Retargeting"
 
     def check_duplicate_mappings(self, context):
-        """
-        Check for duplicate URDF bone assignments.
-
-        Returns:
-            Tuple of (duplicate_bones, bones_by_usage) where:
-            - duplicate_bones: List of bone names assigned multiple times
-            - bones_by_usage: Dict mapping bone names to their assignments
-        """
+        """Check for duplicate URDF bone assignments."""
         settings = context.scene.bvh_mapping_settings
         used_urdf_bones = {}
         duplicates = []
-
         for item in settings.mappings:
             for u_bone in item.urdf_bones:
                 name = u_bone.urdf_bone_name
@@ -268,7 +261,6 @@ class PANEL_BoneMapping(Panel):
                             duplicates.append(name)
                     else:
                         used_urdf_bones[name] = [item.bvh_bone_name]
-
         return duplicates, used_urdf_bones
 
     def draw(self, context):
@@ -276,11 +268,6 @@ class PANEL_BoneMapping(Panel):
         layout = self.layout
         settings = context.scene.bvh_mapping_settings
 
-        if settings.retargeting_method == "KINEMATIC":
-            layout.label(text="Bone mapping is used in Angle/Hybrid mode.", icon="INFO")
-            return
-
-        # Generate mappings button
         layout.operator("object.generate_mapping_list", text="Generate Mapping List")
 
         if not settings.mappings:
@@ -289,7 +276,6 @@ class PANEL_BoneMapping(Panel):
             )
             return
 
-        # Mapping list
         layout.template_list(
             "UL_BVHMappingList",
             "",
@@ -299,7 +285,6 @@ class PANEL_BoneMapping(Panel):
             "active_mapping_index",
         )
 
-        # URDF bone details
         if 0 <= settings.active_mapping_index < len(settings.mappings):
             active = settings.mappings[settings.active_mapping_index]
             box = layout.box()
@@ -320,7 +305,6 @@ class PANEL_BoneMapping(Panel):
                 "object.remove_urdf_bone", text="", icon="REMOVE"
             ).bvh_bone_name = active.bvh_bone_name
 
-        # Duplicate warning
         duplicates, _ = self.check_duplicate_mappings(context)
         if duplicates:
             box = layout.box()
@@ -340,19 +324,13 @@ class PANEL_KinematicChains(Panel):
     bl_idname = "VIEW3D_PT_urdf_kinematic_chains"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "BVH → URDF Retargeting"
+    bl_category = "BVH -> URDF Retargeting"
 
     def draw(self, context):
         """Draw kinematic chain configuration panel."""
         layout = self.layout
         scene = context.scene
         settings = scene.bvh_mapping_settings
-
-        if settings.retargeting_method == "ANGLE":
-            layout.label(
-                text="Kinematic chains are used in Kinematic/Hybrid mode.", icon="INFO"
-            )
-            return
 
         row = layout.row()
         row.template_list(
@@ -403,47 +381,42 @@ class PANEL_KinematicChains(Panel):
                 box.prop(chain, "urdf_end_bone_name")
 
             box.prop(chain, "influence", slider=True)
+            box.separator()
+            box.label(text="Hybrid Adaptive Override", icon="CON_SPLINEIK")
+            box.prop(chain, "use_hybrid_adaptive_override")
+            if chain.use_hybrid_adaptive_override:
+                box.prop(chain, "hybrid_min_ik_blend", slider=True)
+                box.prop(chain, "hybrid_error_low")
+                box.prop(chain, "hybrid_error_high")
             layout.label(
                 text="Define chains from a URDF parent joint to an end-effector joint.",
                 icon="BONE_DATA",
             )
 
 
-class PANEL_ApplyAndExport(Panel):
-    """Panel for applying mappings and exporting data."""
+class PANEL_DefaultPose(Panel):
+    """Panel for configuring the optional custom default pose."""
 
-    bl_label = "Actions"
-    bl_idname = "VIEW3D_PT_urdf_actions"
+    bl_label = "Default Pose"
+    bl_idname = "VIEW3D_PT_urdf_default_pose"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "BVH → URDF Retargeting"
+    bl_category = "BVH -> URDF Retargeting"
+    bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
-        """Draw actions panel."""
+        """Draw default pose configuration panel."""
         layout = self.layout
         settings = context.scene.bvh_mapping_settings
 
-        # Apply mapping
         box = layout.box()
-        box.label(text="Retargeting", icon="PLAY")
-        box.operator("object.apply_bvh_mapping", text="Apply Mapping")
-
-        # Export section
-        box = layout.box()
-        box.label(text="Export", icon="EXPORT")
-        box.prop(settings, "target_hz", text="Export Hz")
-
-        # Export frame range controls (auto-fill to scene range when BVH rig present)
-        row = box.row(align=True)
-        row.prop(settings, "export_from_frame", text="From")
-        row.prop(settings, "export_to_frame", text="To")
-        row = box.row(align=True)
-        row.prop(settings, "export_blend_in_seconds", text="Blend In (s)")
-        row.prop(settings, "export_blend_out_seconds", text="Blend Out (s)")
-        box.prop(settings, "export_end_pose_hold_seconds", text="End Pose Hold (s)")
         box.prop(settings, "use_custom_default_pose", text="Use Custom Default Pose")
 
         if settings.use_custom_default_pose:
+            box.label(
+                text="Used for export blend phases and retarget start pose.",
+                icon="INFO",
+            )
             row = box.row(align=True)
             row.prop(
                 settings,
@@ -457,7 +430,6 @@ class PANEL_ApplyAndExport(Panel):
                 index=1,
                 text="Default Root Pitch",
             )
-
             row = box.row(align=True)
             row.operator(
                 "object.capture_default_pose_from_current",
@@ -474,7 +446,6 @@ class PANEL_ApplyAndExport(Panel):
                 text="Reset Default Pose",
                 icon="LOOP_BACK",
             )
-
             box.template_list(
                 "UL_DefaultPoseJointList",
                 "",
@@ -485,15 +456,86 @@ class PANEL_ApplyAndExport(Panel):
                 rows=5,
             )
 
+
+class PANEL_ApplyAndExport(Panel):
+    """Panel for applying mappings and exporting data."""
+
+    bl_label = "Actions"
+    bl_idname = "VIEW3D_PT_urdf_actions"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "BVH -> URDF Retargeting"
+
+    def draw(self, context):
+        """Draw actions panel."""
+        layout = self.layout
+        settings = context.scene.bvh_mapping_settings
+
+        box = layout.box()
+        box.label(text="Retargeting", icon="PLAY")
+        box.operator("object.apply_bvh_mapping", text="Apply Mapping")
+
+        box = layout.box()
+        box.label(text="Export", icon="EXPORT")
+        box.prop(settings, "target_hz", text="Export Hz")
+        row = box.row(align=True)
+        row.prop(settings, "export_from_frame", text="From")
+        row.prop(settings, "export_to_frame", text="To")
+        row = box.row(align=True)
+        row.prop(settings, "export_blend_in_seconds", text="Blend In (s)")
+        row.prop(settings, "export_blend_out_seconds", text="Blend Out (s)")
+        box.prop(settings, "export_end_pose_hold_seconds", text="End Pose Hold (s)")
+
         op = box.operator("object.export_beyond_mimic", text="Export BeyondMimic")
-        # pass current UI settings as defaults to the operator so file-browser shows them
         op.export_from_frame = settings.export_from_frame
         op.export_to_frame = settings.export_to_frame
         op.default_pose_blend_in_seconds = settings.export_blend_in_seconds
         op.default_pose_blend_out_seconds = settings.export_blend_out_seconds
         op.end_pose_hold_seconds = settings.export_end_pose_hold_seconds
 
-        # Import section
+        box = layout.box()
+        box.label(text="Mapping Preset (JSON)", icon="FILE_FOLDER")
+        box.prop(settings, "mapping_preset_name")
+        box.prop(settings, "mapping_robot_profile")
+        box.prop(settings, "mapping_mocap_profile")
+        box.prop(settings, "mapping_library_preset")
+        row = box.row(align=True)
+        row.operator(
+            "object.load_mapping_preset_library",
+            text="Load Library Preset",
+            icon="FILEBROWSER",
+        )
+        row.operator(
+            "object.save_mapping_preset_library",
+            text="Save To Library",
+            icon="FILE_TICK",
+        )
+        row = box.row(align=True)
+        row.operator(
+            "object.export_mapping_json", text="Export Mapping (JSON)", icon="EXPORT"
+        )
+        row.operator(
+            "object.import_mapping_json", text="Import Mapping (JSON)", icon="IMPORT"
+        )
+
+        from .mapping_io import count_non_quaternion_bones
+
+        non_quat_bvh = count_non_quaternion_bones(context.scene.bvh_rig_object)
+        non_quat_urdf = count_non_quaternion_bones(context.scene.urdf_rig_object)
+        if non_quat_bvh > 0 or non_quat_urdf > 0:
+            warn = layout.box()
+            warn.alert = True
+            warn.label(
+                text=(
+                    "Warning: Non-quaternion bones detected "
+                    f"(BVH: {non_quat_bvh}, URDF: {non_quat_urdf})"
+                ),
+                icon="ERROR",
+            )
+            warn.label(
+                text="Please convert rotation mode in Blender if needed.", icon="INFO"
+            )
+
         box = layout.box()
         box.label(text="Import", icon="IMPORT")
         box.prop(settings, "import_use_meta_hz", text="Use Meta Hz")
@@ -506,7 +548,6 @@ class PANEL_ApplyAndExport(Panel):
         op.manual_hz = settings.import_manual_hz
         op.set_scene_fps = settings.import_set_scene_fps
 
-        # Danger: Clear scene
         box = layout.box()
         box.label(text="Danger Zone", icon="ERROR")
         row = box.row()

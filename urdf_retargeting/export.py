@@ -86,7 +86,6 @@ class OT_ResetDefaultPose(Operator):
     def execute(self, context):
         settings = context.scene.bvh_mapping_settings
         settings.use_custom_default_pose = False
-        settings.default_pose_root_position = (0.0, 0.0, 0.0)
         settings.default_pose_root_rotation = (0.0, 0.0, 0.0)
         settings.default_pose_joints.clear()
         settings.default_pose_active_index = 0
@@ -308,6 +307,9 @@ class OT_ExportBeyondMimic(Operator):
         self._meta_joints = {}
         self._orig_frame = scene.frame_current
         self._phase = 1
+
+        # Export should always evaluate the full-quality retarget path.
+        scene["_export_full_quality"] = True
 
         # Start modal loop — progress tracks frame evaluation
         wm = context.window_manager
@@ -597,6 +599,15 @@ class OT_ExportBeyondMimic(Operator):
                         # Export Settings
                         "bvh_smoothing": settings.bvh_smoothing,
                         "joint_smoothing": settings.joint_smoothing,
+                        "retarget_quality": {
+                            "mode": "full_quality",
+                            "hybrid_ik_blend": settings.hybrid_ik_blend,
+                            "realtime_guard_ui_enabled": settings.hybrid_realtime_guard,
+                            "frame_skip_ui_value": settings.hybrid_ik_frame_skip,
+                            "realtime_guard_applied_during_export": False,
+                            "frame_skip_applied_during_export": False,
+                            "note": "Export forces full IK quality; realtime guard and frame skip are ignored during frame evaluation.",
+                        },
                         # Units
                         "measurement_unit": "meters",
                         "angle_unit": "radians",
@@ -646,6 +657,8 @@ class OT_ExportBeyondMimic(Operator):
 
     def cleanup(self, context):
         """Clean up modal state and restore scene."""
+        if "_export_full_quality" in context.scene:
+            del context.scene["_export_full_quality"]
         context.scene.frame_set(self._orig_frame)
         context.window_manager.event_timer_remove(self._timer)
         context.window_manager.progress_end()

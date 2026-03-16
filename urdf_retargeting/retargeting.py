@@ -34,6 +34,7 @@ Foot-planting uses a single-pass "persistent correction" approach:
 import bpy
 import math
 import hashlib
+import time
 import mathutils
 from bpy.app.handlers import persistent
 from .utils import (
@@ -302,6 +303,7 @@ def apply_kinematic_retargeting(
     settings,
     scene: bpy.types.Scene,
     correction_blend: float = 1.0,
+    max_iterations_override: int | None = None,
 ) -> None:
     """Retarget URDF joint chains by solving BVH end-effector targets with CCD IK."""
     if "_kinematic_target_cache" not in scene:
@@ -397,11 +399,18 @@ def apply_kinematic_retargeting(
 
         # Clamp target distance to reachable chain length to avoid solver instability.
         chain_root_world = _get_pose_bone_world_position(urdf_obj, full_chain[0])
-        chain_reach = 0.0
-        for i in range(1, len(full_chain)):
-            a = _get_pose_bone_world_position(urdf_obj, full_chain[i - 1])
-            b = _get_pose_bone_world_position(urdf_obj, full_chain[i])
-            chain_reach += (b - a).length
+        chain_reach_key = f"ik_reach_{chain_key}"
+        if chain_reach_key in target_cache:
+            chain_reach = float(target_cache[chain_reach_key])
+        else:
+            chain_reach = sum(max(0.0, b.bone.length) for b in full_chain)
+            if chain_reach <= 1e-9:
+                chain_reach = 0.0
+                for i in range(1, len(full_chain)):
+                    a = _get_pose_bone_world_position(urdf_obj, full_chain[i - 1])
+                    b = _get_pose_bone_world_position(urdf_obj, full_chain[i])
+                    chain_reach += (b - a).length
+            target_cache[chain_reach_key] = chain_reach
 
         to_target = target_world - chain_root_world
         if chain_reach > 1e-6 and to_target.length > chain_reach:
@@ -416,10 +425,77 @@ def apply_kinematic_retargeting(
             initial_value=end_world_now,
         )
 
+        pre_error = (target_world - end_world_now).length
+
+        # Hybrid mode can adapt IK strength by current target error:
+        # keep FK-dominant behavior for tiny residuals and progressively
+        # increase IK influence when end-effector error grows.
+        chain_blend = correction_blend
+        if settings.retargeting_method == "HYBRID" and getattr(
+            settings, "hybrid_adaptive_ik", False
+        ):
+            use_chain_override = getattr(chain, "use_hybrid_adaptive_override", False)
+            if use_chain_override:
+                low = max(1e-6, chain.hybrid_error_low)
+                high = max(low + 1e-6, chain.hybrid_error_high)
+                min_blend = clamp_to_limits(chain.hybrid_min_ik_blend, 0.0, 1.0)
+            else:
+                low = max(1e-6, settings.hybrid_error_low)
+                high = max(low + 1e-6, settings.hybrid_error_high)
+                min_blend = clamp_to_limits(settings.hybrid_min_ik_blend, 0.0, 1.0)
+
+            t = (pre_error - low) / (high - low)
+            t = clamp_to_limits(t, 0.0, 1.0)
+            adaptive_gain = min_blend + (1.0 - min_blend) * t
+            chain_blend *= adaptive_gain
+
+        # Smooth chain blend over time to avoid frame-to-frame jitter.
+        blend_key = f"ik_blend_{chain_key}"
+        prev_blend = target_cache.get(blend_key, chain_blend)
+        smooth = clamp_to_limits(
+            getattr(settings, "hybrid_blend_smoothing", 0.8),
+            0.0,
+            0.98,
+        )
+        chain_blend = (smooth * float(prev_blend)) + (
+            (1.0 - smooth) * float(chain_blend)
+        )
+        target_cache[blend_key] = chain_blend
+
         for pose_bone in solver_bones:
             pose_bone.rotation_mode = "QUATERNION"
 
-        for _ in range(settings.ik_iterations):
+        # Capture the per-bone angle from the *previous frame* before the solver
+        # changes anything.  Used by the post-solver EMA pass so that cross-frame
+        # temporal smoothing is cleanly separated from intra-frame CCD convergence.
+        # Mixing these two concerns inside the iteration loop caused the solver to
+        # fight its own inertia on every step, leaving a residual error that
+        # oscillated frame-to-frame (the source of the observed jitter).
+        joint_smooth = max(0.0, getattr(settings, "ik_joint_smoothing", 0.0))
+        if joint_smooth > 0.0:
+            prev_frame_angles = {
+                pb.name: get_bone_property(
+                    pb,
+                    "_ik_last_angle",
+                    get_bone_property(pb, "_joint_angle", 0.0),
+                )
+                for pb in solver_bones
+            }
+
+        max_iterations = (
+            int(max_iterations_override)
+            if max_iterations_override is not None
+            else int(settings.ik_iterations)
+        )
+        if settings.retargeting_method == "HYBRID":
+            blend_factor = clamp_to_limits(chain_blend, 0.15, 1.0)
+            max_iterations = int(round(max_iterations * blend_factor))
+        max_iterations = max(1, max_iterations)
+        for _ in range(max_iterations):
+            # Single update at the start of each iteration gives every bone
+            # consistent world-space positions (Jacobi CCD).  Mid-iteration
+            # batch-updates caused asymmetric corrections within one sweep
+            # and contributed to jitter.
             bpy.context.view_layer.update()
             end_world = _get_pose_bone_world_position(urdf_obj, end_bone)
             dist_error = (target_world - end_world).length
@@ -452,12 +528,22 @@ def apply_kinematic_retargeting(
                     axis_world,
                 )
                 angle_delta *= chain.influence
-                angle_delta *= correction_blend
+                angle_delta *= chain_blend
                 angle_delta = clamp_to_limits(
                     angle_delta,
                     -settings.ik_max_step_angle,
                     settings.ik_max_step_angle,
                 )
+
+                # Ignore tiny near-converged angle corrections to reduce
+                # visible high-frequency jitter.
+                micro_deadzone = max(0.0, settings.ik_micro_deadzone)
+                if (
+                    abs(angle_delta) < micro_deadzone
+                    and dist_error <= settings.ik_tolerance * 3.0
+                ):
+                    continue
+
                 # For very small numeric angles, apply a tiny signed nudge if
                 # the end-effector is still far from target to avoid stalling.
                 if abs(angle_delta) < 1e-5 and dist_error > settings.ik_tolerance * 4.0:
@@ -473,29 +559,59 @@ def apply_kinematic_retargeting(
                 current_angle = get_bone_property(pose_bone, "_joint_angle", 0.0)
                 _apply_final_angle(pose_bone, current_angle + angle_delta, joint_type)
                 made_progress = True
-                bpy.context.view_layer.update()
 
             if not made_progress:
                 break
+
+        # Guarantee world-space transforms reflect the final solved state before
+        # the post-solver pass and the rest of the retargeting pipeline.
+        bpy.context.view_layer.update()
+
+        # --- Post-solver temporal EMA smoothing ---
+        # Applied AFTER full CCD convergence so the previous-frame memory in
+        # _ik_last_angle does not resist the solver mid-iteration.  The EMA
+        # compares this frame's converged angle against last frame's final
+        # smoothed angle — a clean cross-frame operation with no side-effects
+        # on intra-frame convergence.
+        if joint_smooth > 0.0:
+            for pb in solver_bones:
+                final_angle = get_bone_property(pb, "_joint_angle", 0.0)
+                prev_angle = prev_frame_angles.get(pb.name, final_angle)
+                jtype = get_bone_property(pb, "joint_type", "revolute")
+                smoothed = apply_exponential_smoothing(
+                    final_angle, prev_angle, joint_smooth
+                )
+                set_bone_property(pb, "_ik_last_angle", smoothed)
+                _apply_final_angle(pb, smoothed, jtype)
+            bpy.context.view_layer.update()
 
 
 def get_lowest_z_world(urdf_obj: bpy.types.Object) -> float:
     """
     Find the lowest Z-coordinate (height) of all visual meshes in world space.
 
-    This is used to determine the ground plane position for foot contact detection
-    and anti-sinking corrections.
+                    set_bone_property(pb, "_ik_last_angle", smoothed)
+                    _apply_final_angle(pb, smoothed, jtype)
+                bpy.context.view_layer.update()
 
-    Args:
-        urdf_obj: The URDF armature object (may contain child mesh objects).
+            # Sync FK memory to IK-corrected output so the FK baseline in the
+            # next frame starts from the actual output position, not a stale
+            # pure-FK value.  This prevents IK from having to redo the same
+            # offset correction on every frame (FK-IK fighting).
+            for pb in solver_bones:
+                set_bone_property(
+                    pb,
+                    "_last_urdf_angle",
+                    get_bone_property(pb, "_joint_angle", 0.0),
+                )
 
+
+    def get_lowest_z_world(urdf_obj: bpy.types.Object) -> float:
     Returns:
         The minimum Z-coordinate found. If no meshes exist, uses bone positions.
     """
     global_min_z = float("inf")
     found_mesh = False
-
-    bpy.context.view_layer.update()
 
     # Iterate through all objects parented to the rig (links/visuals)
     for child in urdf_obj.children:
@@ -548,6 +664,9 @@ def detect_stance_foot(
     if "_foot_positions" not in scene:
         scene["_foot_positions"] = {}
     last_positions = scene["_foot_positions"]
+    if "_foot_contact_state" not in scene:
+        scene["_foot_contact_state"] = {}
+    contact_state = scene["_foot_contact_state"]
 
     active_contacts: list[str] = []
     foot_velocities: dict[str, float] = {}
@@ -568,7 +687,19 @@ def detect_stance_foot(
         foot_velocities[f_name] = vel
         last_positions[f_name] = foot_world.copy()
 
-        if foot_height <= settings.jump_threshold:
+        # Contact hysteresis avoids rapid grounded/airborne toggling
+        # when foot height hovers around the threshold.
+        was_grounded = bool(contact_state.get(f_name, False))
+        if was_grounded:
+            grounded = (
+                foot_height
+                <= settings.jump_threshold + settings.foot_contact_hysteresis
+            )
+        else:
+            grounded = foot_height <= settings.jump_threshold
+
+        contact_state[f_name] = grounded
+        if grounded:
             active_contacts.append(f_name)
 
     # --- anchor selection ---
@@ -832,6 +963,8 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     if not settings.live_retarget:
         return
 
+    t_start = time.perf_counter()
+
     urdf = scene.urdf_rig_object
     bvh = scene.smoothed_bvh_rig_object
     if not urdf or not bvh:
@@ -857,6 +990,7 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
         scene["_anchor_world_yaw"] = None
         scene["_anchor_bvh_yaw"] = None
         scene["_foot_positions"] = {}
+        scene["_foot_contact_state"] = {}
 
     # ------------------------------------------------------------------
     # 1.  BVH root position  (scaled delta from reference)
@@ -918,21 +1052,62 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     # ------------------------------------------------------------------
     # 3.  Joint retargeting  (angle extraction or kinematic IK)
     # ------------------------------------------------------------------
-    if settings.retargeting_method == "KINEMATIC":
-        apply_kinematic_retargeting(urdf, bvh, settings, scene)
-    elif settings.retargeting_method == "HYBRID":
-        for item in settings.mappings:
-            apply_joint_retargeting(urdf, bvh, item, smooth_cache, settings, scene)
+    t_stage_start = time.perf_counter()
+
+    # Legacy scene compatibility: ANGLE/KINEMATIC values are treated as HYBRID.
+    if settings.retargeting_method != "HYBRID":
+        settings.retargeting_method = "HYBRID"
+
+    t_fk_start = time.perf_counter()
+    for item in settings.mappings:
+        apply_joint_retargeting(urdf, bvh, item, smooth_cache, settings, scene)
+    scene["_retarget_ms_fk"] = (time.perf_counter() - t_fk_start) * 1000.0
+
+    export_full_quality = bool(scene.get("_export_full_quality", False))
+
+    # Performance shortcut: pure FK mode when IK blend is zero.
+    if settings.hybrid_ik_blend <= 1e-6:
+        scene["_retarget_ms_ik"] = 0.0
+    else:
+        hybrid_iterations_override = None
+        if settings.hybrid_realtime_guard and not export_full_quality:
+            avg_ms = scene.get("_retarget_ms_ema", None)
+            fps = scene.render.fps if scene.render.fps > 0 else 60.0
+            budget_ms = 1000.0 / fps
+            if avg_ms is not None and avg_ms > budget_ms:
+                overload_ratio = min(1.0, (avg_ms - budget_ms) / max(1e-6, budget_ms))
+                throttle = 1.0 - 0.7 * overload_ratio
+                target_iter = int(round(settings.ik_iterations * throttle))
+                hybrid_iterations_override = max(
+                    int(settings.hybrid_min_iterations),
+                    max(1, target_iter),
+                )
+
+        ik_skip = (
+            0
+            if export_full_quality
+            else max(0, int(getattr(settings, "hybrid_ik_frame_skip", 0)))
+        )
+        run_ik_this_frame = (scene.frame_current % (ik_skip + 1)) == 0
+        t_ik_start = time.perf_counter()
+        if run_ik_this_frame:
+            iter_override = hybrid_iterations_override
+            blend_override = settings.hybrid_ik_blend
+        else:
+            # Keep a tiny IK pass on skipped frames to prevent visible
+            # oscillation from alternating FK-only / FK+IK states.
+            iter_override = 1
+            blend_override = settings.hybrid_ik_blend * 0.35
+
         apply_kinematic_retargeting(
             urdf,
             bvh,
             settings,
             scene,
-            correction_blend=settings.hybrid_ik_blend,
+            correction_blend=blend_override,
+            max_iterations_override=iter_override,
         )
-    else:
-        for item in settings.mappings:
-            apply_joint_retargeting(urdf, bvh, item, smooth_cache, settings, scene)
+        scene["_retarget_ms_ik"] = (time.perf_counter() - t_ik_start) * 1000.0
 
     # ------------------------------------------------------------------
     # 4.  Foot alignment  (flatten near ground)
@@ -1026,7 +1201,9 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
                 yaw_residual = _wrap_angle(urdf_yaw_change - bvh_yaw_change)
 
                 if abs(yaw_residual) > 1e-6:
-                    yaw_fix_q = mathutils.Quaternion((0, 0, 1), -yaw_residual)
+                    max_yaw = max(1e-5, settings.foot_pin_yaw_max_step)
+                    yaw_step = clamp_to_limits(-yaw_residual, -max_yaw, max_yaw)
+                    yaw_fix_q = mathutils.Quaternion((0, 0, 1), yaw_step)
 
                     # --- Rotate root orientation ---
                     urdf.rotation_quaternion = yaw_fix_q @ urdf.rotation_quaternion
@@ -1069,6 +1246,14 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
 
                 drift_x = foot_world.x - anchor_x
                 drift_y = foot_world.y - anchor_y
+
+                # Limit per-frame XY correction to avoid visible snapping.
+                max_xy = max(1e-6, settings.foot_pin_xy_max_step)
+                drift_len = math.hypot(drift_x, drift_y)
+                if drift_len > max_xy:
+                    scale = max_xy / drift_len
+                    drift_x *= scale
+                    drift_y *= scale
 
                 # Correct root 100 % — translation is additive, so this is exact
                 urdf.location.x -= drift_x
@@ -1165,8 +1350,18 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     # ------------------------------------------------------------------
     # 8.  Anti-sinking guard
     # ------------------------------------------------------------------
+    t_sink_start = time.perf_counter()
     bpy.context.view_layer.update()
     current_min_z = get_lowest_z_world(urdf)
 
     if current_min_z < -1e-4:
         urdf.location.z += abs(current_min_z)
+    scene["_retarget_ms_sink"] = (time.perf_counter() - t_sink_start) * 1000.0
+
+    # Runtime telemetry (EMA) for quick realtime tuning feedback in UI.
+    elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+    prev_ms = scene.get("_retarget_ms_ema", None)
+    if prev_ms is None:
+        scene["_retarget_ms_ema"] = elapsed_ms
+    else:
+        scene["_retarget_ms_ema"] = (0.9 * float(prev_ms)) + (0.1 * elapsed_ms)

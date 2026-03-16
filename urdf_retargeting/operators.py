@@ -9,11 +9,19 @@ import bpy
 import os
 import mathutils
 from bpy.types import Operator
-from bpy_extras.io_utils import ImportHelper
+from bpy_extras.io_utils import ImportHelper, ExportHelper
 from bpy_extras.anim_utils import action_get_channelbag_for_slot
 from .urdf import parse_urdf
 from .armature import create_urdf_armature, bind_meshes
 from .retargeting import get_lowest_z_world, apply_custom_default_pose_to_urdf
+from .mapping_io import (
+    export_mapping_to_json,
+    import_mapping_from_json,
+    count_non_quaternion_bones,
+    get_preset_library_dir,
+    ensure_preset_library_dir,
+    sanitize_preset_filename,
+)
 
 
 class OT_GenerateMappingList(Operator):
@@ -247,6 +255,7 @@ class OT_ApplyBVHMapping(Operator):
                 "offset",
                 "_joint_angle",
                 "_last_urdf_angle",
+                "_ik_last_angle",
                 "is_velocity_limited",
             ):
                 if key in pb:
@@ -460,6 +469,166 @@ class OT_RemoveKinematicChain(Operator):
         index = max(0, min(index, len(settings.kinematic_chains) - 1))
         settings.kinematic_chains.remove(index)
         settings.active_kinematic_chain_index = max(0, index - 1)
+        return {"FINISHED"}
+
+
+class OT_ExportMappingJSON(Operator, ExportHelper):
+    """Export current mapping and kinematic chains as JSON preset."""
+
+    bl_idname = "object.export_mapping_json"
+    bl_label = "Export Mapping JSON"
+    bl_description = "Save BVH/URDF mapping and kinematic chains as a JSON preset"
+
+    filename_ext = ".json"
+    filter_glob: bpy.props.StringProperty(default="*.json", options={"HIDDEN"})
+
+    def execute(self, context):
+        scene = context.scene
+        settings = scene.bvh_mapping_settings
+
+        urdf_name = scene.urdf_rig_object.name if scene.urdf_rig_object else ""
+        bvh_name = scene.bvh_rig_object.name if scene.bvh_rig_object else ""
+
+        metadata = {
+            "preset_name": settings.mapping_preset_name,
+            "robot_profile": settings.mapping_robot_profile,
+            "mocap_profile": settings.mapping_mocap_profile,
+            "urdf_rig_name": urdf_name,
+            "bvh_rig_name": bvh_name,
+        }
+        export_mapping_to_json(self.filepath, settings, metadata=metadata)
+
+        self.report(
+            {"INFO"},
+            f"Mapping preset exported: {os.path.basename(self.filepath)}",
+        )
+        return {"FINISHED"}
+
+
+class OT_ImportMappingJSON(Operator, ImportHelper):
+    """Import mapping and kinematic chains from JSON preset."""
+
+    bl_idname = "object.import_mapping_json"
+    bl_label = "Import Mapping JSON"
+    bl_description = "Load BVH/URDF mapping and kinematic chains from a JSON preset"
+
+    filename_ext = ".json"
+    filter_glob: bpy.props.StringProperty(default="*.json", options={"HIDDEN"})
+
+    def execute(self, context):
+        scene = context.scene
+        settings = scene.bvh_mapping_settings
+
+        metadata = import_mapping_from_json(self.filepath, settings)
+
+        # Keep metadata in UI so users can maintain human-readable presets.
+        settings.mapping_preset_name = metadata.get("preset_name", "")
+        settings.mapping_robot_profile = metadata.get("robot_profile", "")
+        settings.mapping_mocap_profile = metadata.get("mocap_profile", "")
+
+        # Soft compatibility warning: preset target/source profile vs. current rigs.
+        current_urdf = scene.urdf_rig_object.name if scene.urdf_rig_object else ""
+        current_bvh = scene.bvh_rig_object.name if scene.bvh_rig_object else ""
+        preset_urdf = metadata.get("urdf_rig_name", "")
+        preset_bvh = metadata.get("bvh_rig_name", "")
+
+        mismatch = []
+        if preset_urdf and current_urdf and preset_urdf != current_urdf:
+            mismatch.append(f"URDF preset={preset_urdf}, scene={current_urdf}")
+        if preset_bvh and current_bvh and preset_bvh != current_bvh:
+            mismatch.append(f"BVH preset={preset_bvh}, scene={current_bvh}")
+
+        if mismatch:
+            self.report(
+                {"WARNING"},
+                "Preset may not match current rig pair: " + " | ".join(mismatch),
+            )
+
+        # Quaternion warning only (no conversion), as requested.
+        non_quat_bvh = count_non_quaternion_bones(scene.bvh_rig_object)
+        non_quat_urdf = count_non_quaternion_bones(scene.urdf_rig_object)
+        if non_quat_bvh > 0 or non_quat_urdf > 0:
+            self.report(
+                {"WARNING"},
+                (
+                    "Detected non-quaternion rotation mode bones "
+                    f"(BVH={non_quat_bvh}, URDF={non_quat_urdf}). "
+                    "Please convert in Blender if needed."
+                ),
+            )
+
+        self.report(
+            {"INFO"},
+            f"Mapping preset imported: {os.path.basename(self.filepath)}",
+        )
+        return {"FINISHED"}
+
+
+class OT_LoadMappingPresetLibrary(Operator):
+    """Load selected preset from bundled preset library folder."""
+
+    bl_idname = "object.load_mapping_preset_library"
+    bl_label = "Load Library Preset"
+    bl_description = "Load selected preset from urdf_retargeting/presets/mappings"
+
+    def execute(self, context):
+        scene = context.scene
+        settings = scene.bvh_mapping_settings
+        preset_file = settings.mapping_library_preset
+
+        if not preset_file:
+            self.report({"ERROR"}, "No library preset selected.")
+            return {"CANCELLED"}
+
+        path = os.path.join(get_preset_library_dir(), preset_file)
+        if not os.path.isfile(path):
+            self.report({"ERROR"}, f"Preset not found: {preset_file}")
+            return {"CANCELLED"}
+
+        metadata = import_mapping_from_json(path, settings)
+        settings.mapping_preset_name = metadata.get("preset_name", "")
+        settings.mapping_robot_profile = metadata.get("robot_profile", "")
+        settings.mapping_mocap_profile = metadata.get("mocap_profile", "")
+
+        self.report({"INFO"}, f"Loaded library preset: {preset_file}")
+        return {"FINISHED"}
+
+
+class OT_SaveMappingPresetLibrary(Operator):
+    """Save current mapping to bundled preset library folder."""
+
+    bl_idname = "object.save_mapping_preset_library"
+    bl_label = "Save To Library"
+    bl_description = "Save current mapping preset to urdf_retargeting/presets/mappings"
+
+    def execute(self, context):
+        scene = context.scene
+        settings = scene.bvh_mapping_settings
+
+        if not settings.mapping_preset_name.strip():
+            self.report(
+                {"ERROR"},
+                "Preset Name is required before saving to library.",
+            )
+            return {"CANCELLED"}
+
+        directory = ensure_preset_library_dir()
+        filename = sanitize_preset_filename(settings.mapping_preset_name)
+        path = os.path.join(directory, filename)
+
+        metadata = {
+            "preset_name": settings.mapping_preset_name,
+            "robot_profile": settings.mapping_robot_profile,
+            "mocap_profile": settings.mapping_mocap_profile,
+            "urdf_rig_name": (
+                scene.urdf_rig_object.name if scene.urdf_rig_object else ""
+            ),
+            "bvh_rig_name": scene.bvh_rig_object.name if scene.bvh_rig_object else "",
+        }
+        export_mapping_to_json(path, settings, metadata=metadata)
+        settings.mapping_library_preset = filename
+
+        self.report({"INFO"}, f"Saved library preset: {filename}")
         return {"FINISHED"}
 
 

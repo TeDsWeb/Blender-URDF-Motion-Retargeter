@@ -5,6 +5,8 @@ Defines the data models for storing mapping configurations, bone constraints,
 and retargeting parameters.
 """
 
+import os
+
 from bpy.props import (
     StringProperty,
     CollectionProperty,
@@ -15,6 +17,22 @@ from bpy.props import (
     IntProperty,
 )
 from bpy.types import PropertyGroup
+
+
+def _mapping_preset_items(self, context):
+    """Build dropdown items from bundled preset JSON files."""
+    base_dir = os.path.dirname(__file__)
+    preset_dir = os.path.join(base_dir, "presets", "mappings")
+
+    items = []
+    if os.path.isdir(preset_dir):
+        for name in sorted(os.listdir(preset_dir)):
+            if name.lower().endswith(".json"):
+                items.append((name, name, f"Load preset {name}"))
+
+    if not items:
+        items.append(("", "<no presets found>", "No preset JSON files found"))
+    return items
 
 
 class BVHMappingBone(PropertyGroup):
@@ -96,6 +114,34 @@ class KinematicChainMapping(PropertyGroup):
         min=0.0,
         max=1.0,
     )
+    use_hybrid_adaptive_override: BoolProperty(
+        name="Adaptive Override",
+        description="Use chain-specific adaptive Hybrid IK parameters",
+        default=False,
+    )
+    hybrid_min_ik_blend: FloatProperty(
+        name="Min IK",
+        description="Chain-specific minimum IK blend in adaptive Hybrid mode",
+        default=0.2,
+        min=0.0,
+        max=1.0,
+    )
+    hybrid_error_low: FloatProperty(
+        name="Error Low",
+        description="Below this error, adaptive Hybrid IK uses minimum strength",
+        default=0.01,
+        min=0.0001,
+        max=0.2,
+        subtype="DISTANCE",
+    )
+    hybrid_error_high: FloatProperty(
+        name="Error High",
+        description="Above this error, adaptive Hybrid IK uses full strength",
+        default=0.08,
+        min=0.001,
+        max=0.5,
+        subtype="DISTANCE",
+    )
 
 
 class DefaultPoseJoint(PropertyGroup):
@@ -108,7 +154,7 @@ class DefaultPoseJoint(PropertyGroup):
     )
     angle: FloatProperty(
         name="Angle",
-        description="Default angle for this joint used in export blend phases",
+        description="Default angle for this joint used in export blend phases and the initial retarget start pose",
         subtype="ANGLE",
         default=0.0,
     )
@@ -137,6 +183,28 @@ class BVHMappingSettings(PropertyGroup):
         description="Index of the currently selected URDF bone in the mapping",
     )
 
+    # Mapping Preset Metadata
+    mapping_preset_name: StringProperty(
+        name="Preset Name",
+        description="Human-readable preset name (e.g., BoosterK1_OptiTrack_v1)",
+        default="",
+    )
+    mapping_robot_profile: StringProperty(
+        name="Robot Profile",
+        description="Target robot profile this mapping was created for",
+        default="",
+    )
+    mapping_mocap_profile: StringProperty(
+        name="MoCap Profile",
+        description="Source skeleton/profile this mapping was created for",
+        default="",
+    )
+    mapping_library_preset: EnumProperty(
+        name="Library Preset",
+        description="Select a JSON preset from urdf_retargeting/presets/mappings",
+        items=_mapping_preset_items,
+    )
+
     # Retargeting Control
     live_retarget: BoolProperty(
         name="Live Retargeting",
@@ -145,17 +213,17 @@ class BVHMappingSettings(PropertyGroup):
     )
     retargeting_method: EnumProperty(
         name="Retargeting Method",
-        description="Select the retargeting backend",
+        description="Select the retargeting backend (ANGLE/KINEMATIC are legacy and mapped to HYBRID at runtime)",
         items=[
             (
                 "ANGLE",
-                "Angle Mapping",
-                "Drive URDF joints by extracting twist angles from BVH joints",
+                "Angle Mapping (Legacy)",
+                "Legacy mode kept for old scenes; runtime uses HYBRID",
             ),
             (
                 "KINEMATIC",
-                "Kinematic IK",
-                "Drive URDF chains by matching BVH end-effector positions with IK",
+                "Kinematic IK (Legacy)",
+                "Legacy mode kept for old scenes; runtime uses HYBRID",
             ),
             (
                 "HYBRID",
@@ -163,7 +231,37 @@ class BVHMappingSettings(PropertyGroup):
                 "Use FK as baseline and IK as corrective end-effector refinement",
             ),
         ],
-        default="ANGLE",
+        default="HYBRID",
+    )
+    ui_show_root_advanced: BoolProperty(
+        name="Show Root Advanced",
+        description="Show advanced root-motion controls",
+        default=False,
+        options={"SKIP_SAVE"},
+    )
+    ui_show_fk_advanced: BoolProperty(
+        name="Show FK Advanced",
+        description="Show advanced FK baseline controls",
+        default=False,
+        options={"SKIP_SAVE"},
+    )
+    ui_show_ik_advanced: BoolProperty(
+        name="Show IK Advanced",
+        description="Show advanced IK correction controls",
+        default=False,
+        options={"SKIP_SAVE"},
+    )
+    ui_show_performance_advanced: BoolProperty(
+        name="Show Performance Advanced",
+        description="Show advanced performance controls",
+        default=False,
+        options={"SKIP_SAVE"},
+    )
+    ui_show_foot_advanced: BoolProperty(
+        name="Show Foot Advanced",
+        description="Show advanced foot contact controls",
+        default=False,
+        options={"SKIP_SAVE"},
     )
 
     # Motion Smoothing
@@ -238,7 +336,22 @@ class BVHMappingSettings(PropertyGroup):
         description="Low-pass filter on end-effector target positions",
         default=0.25,
         min=0.0,
+        max=0.98,
+    )
+    ik_joint_smoothing: FloatProperty(
+        name="IK Joint Smoothing",
+        description="Low-pass smoothing on solved IK joint angles",
+        default=0.12,
+        min=0.0,
         max=1.0,
+    )
+    ik_micro_deadzone: FloatProperty(
+        name="IK Micro Deadzone",
+        description="Ignore tiny IK angle updates near convergence to reduce micro-jitter",
+        default=0.0015,
+        min=0.0,
+        max=0.05,
+        subtype="ANGLE",
     )
     hybrid_ik_blend: FloatProperty(
         name="Hybrid IK Blend",
@@ -246,6 +359,69 @@ class BVHMappingSettings(PropertyGroup):
         default=0.5,
         min=0.0,
         max=1.0,
+    )
+    hybrid_adaptive_ik: BoolProperty(
+        name="Adaptive Hybrid IK",
+        description=(
+            "Scale IK correction strength by end-effector error in Hybrid mode "
+            "(small error => less IK, large error => more IK)"
+        ),
+        default=True,
+    )
+    hybrid_min_ik_blend: FloatProperty(
+        name="Hybrid Min IK",
+        description="Minimum IK blend fraction used by adaptive Hybrid mode",
+        default=0.2,
+        min=0.0,
+        max=1.0,
+    )
+    hybrid_error_low: FloatProperty(
+        name="Hybrid Error Low",
+        description="At or below this end-effector error, adaptive IK uses minimum strength",
+        default=0.01,
+        min=0.0001,
+        max=0.2,
+        subtype="DISTANCE",
+    )
+    hybrid_error_high: FloatProperty(
+        name="Hybrid Error High",
+        description="At or above this end-effector error, adaptive IK uses full strength",
+        default=0.08,
+        min=0.001,
+        max=0.5,
+        subtype="DISTANCE",
+    )
+    hybrid_blend_smoothing: FloatProperty(
+        name="Hybrid Blend Smoothing",
+        description="Temporal smoothing of adaptive per-chain IK blend (higher = smoother)",
+        default=0.8,
+        min=0.0,
+        max=0.98,
+    )
+    hybrid_realtime_guard: BoolProperty(
+        name="Hybrid Realtime Guard",
+        description=(
+            "Dynamically reduce IK iterations when retargeting time exceeds "
+            "the current frame budget"
+        ),
+        default=True,
+    )
+    hybrid_min_iterations: IntProperty(
+        name="Hybrid Min Iterations",
+        description="Lower bound for IK iterations when realtime guard throttles",
+        default=4,
+        min=1,
+        max=64,
+    )
+    hybrid_ik_frame_skip: IntProperty(
+        name="Hybrid IK Frame Skip",
+        description=(
+            "Skip N frames between Hybrid IK passes (0 = IK every frame, "
+            "1 = every second frame)"
+        ),
+        default=0,
+        min=0,
+        max=8,
     )
 
     # Foot Contact & Anchoring
@@ -264,6 +440,38 @@ class BVHMappingSettings(PropertyGroup):
         description="Minimum vertical movement to register a jump (in meters)",
         default=0.01,
         min=0.0,
+    )
+    foot_contact_hysteresis: FloatProperty(
+        name="Contact Hysteresis",
+        description=(
+            "Additional height hysteresis (meters) to avoid rapid foot "
+            "contact toggling near the jump threshold"
+        ),
+        default=0.005,
+        min=0.0,
+        max=0.05,
+    )
+    foot_pin_xy_max_step: FloatProperty(
+        name="Pin XY Max Step",
+        description=(
+            "Maximum XY root correction per frame for foot pinning "
+            "(smaller values reduce jitter but allow short-lived micro-slip)"
+        ),
+        default=0.03,
+        min=0.001,
+        max=0.2,
+        subtype="DISTANCE",
+    )
+    foot_pin_yaw_max_step: FloatProperty(
+        name="Pin Yaw Max Step",
+        description=(
+            "Maximum yaw correction per frame for foot pinning "
+            "(limits sudden heading jumps)"
+        ),
+        default=0.12,
+        min=0.005,
+        max=1.0,
+        subtype="ANGLE",
     )
 
     # Foot Flattening
@@ -359,15 +567,8 @@ class BVHMappingSettings(PropertyGroup):
     )
     use_custom_default_pose: BoolProperty(
         name="Use Custom Default Pose",
-        description="Use custom default pose settings for export blend-in/out instead of calibrated neutral pose",
+        description="Use custom default pose settings for export blend phases and as the initial URDF pose before retarget calibration",
         default=False,
-    )
-    default_pose_root_position: FloatVectorProperty(
-        name="Default Root Position",
-        description="Custom default root position (world space)",
-        subtype="TRANSLATION",
-        size=3,
-        default=(0.0, 0.0, 0.0),
     )
     default_pose_root_rotation: FloatVectorProperty(
         name="Default Root Rotation",
@@ -378,7 +579,7 @@ class BVHMappingSettings(PropertyGroup):
     )
     default_pose_joints: CollectionProperty(
         type=DefaultPoseJoint,
-        description="Editable default joint angles used for export blend phases",
+        description="Editable default joint angles used for export blend phases and initial retarget pose",
     )
     default_pose_active_index: IntProperty(
         name="Default Pose Joint Index",

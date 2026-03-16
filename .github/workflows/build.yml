@@ -1,0 +1,45 @@
+name: Build Blender Extension
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read version from blender_manifest.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' urdf_retargeting/blender_manifest.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build extension ZIP
+        run: |
+          cd urdf_retargeting
+          zip -r ../urdf_retargeting.zip . \
+            --exclude "**/__pycache__/*" \
+            --exclude "**/*.pyc" \
+            --exclude "**/*.pyo"
+
+      - name: Upload extension as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: urdf_retargeting-v${{ steps.version.outputs.version }}-${{ github.sha }}
+          path: urdf_retargeting.zip
+          retention-days: 90
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "URDF Retargeting v${{ steps.version.outputs.version }}"
+          files: urdf_retargeting.zip
+          generate_release_notes: true
