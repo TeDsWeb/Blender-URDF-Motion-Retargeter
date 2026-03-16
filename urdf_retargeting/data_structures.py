@@ -66,6 +66,38 @@ class BVHMappingItem(PropertyGroup):
     )
 
 
+class KinematicChainMapping(PropertyGroup):
+    """Defines a BVH target and a URDF joint chain for IK retargeting."""
+
+    label: StringProperty(
+        name="Label",
+        description="Optional name for this kinematic chain",
+        default="",
+    )
+    bvh_target_bone_name: StringProperty(
+        name="BVH Target",
+        description="BVH end-effector bone whose position should be matched",
+        default="",
+    )
+    urdf_root_bone_name: StringProperty(
+        name="URDF Root Joint",
+        description="First URDF joint in the kinematic chain",
+        default="",
+    )
+    urdf_end_bone_name: StringProperty(
+        name="URDF End Joint",
+        description="Last URDF joint / end effector in the kinematic chain",
+        default="",
+    )
+    influence: FloatProperty(
+        name="Influence",
+        description="How strongly the IK chain should follow the BVH target",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+    )
+
+
 class DefaultPoseJoint(PropertyGroup):
     """Editable default-pose angle for one URDF joint."""
 
@@ -88,9 +120,17 @@ class BVHMappingSettings(PropertyGroup):
     mappings: CollectionProperty(
         type=BVHMappingItem, description="List of BVH-to-URDF bone mappings"
     )
+    kinematic_chains: CollectionProperty(
+        type=KinematicChainMapping,
+        description="List of BVH-to-URDF kinematic target chains",
+    )
     active_mapping_index: IntProperty(
         name="Active Mapping Index",
         description="Index of the currently selected mapping in the UI",
+    )
+    active_kinematic_chain_index: IntProperty(
+        name="Active Kinematic Chain Index",
+        description="Index of the currently selected kinematic chain in the UI",
     )
     active_urdf_index: IntProperty(
         name="Active URDF Index",
@@ -102,6 +142,28 @@ class BVHMappingSettings(PropertyGroup):
         name="Live Retargeting",
         description="Enable real-time retargeting on frame changes",
         default=False,
+    )
+    retargeting_method: EnumProperty(
+        name="Retargeting Method",
+        description="Select the retargeting backend",
+        items=[
+            (
+                "ANGLE",
+                "Angle Mapping",
+                "Drive URDF joints by extracting twist angles from BVH joints",
+            ),
+            (
+                "KINEMATIC",
+                "Kinematic IK",
+                "Drive URDF chains by matching BVH end-effector positions with IK",
+            ),
+            (
+                "HYBRID",
+                "Hybrid FK + IK",
+                "Use FK as baseline and IK as corrective end-effector refinement",
+            ),
+        ],
+        default="ANGLE",
     )
 
     # Motion Smoothing
@@ -126,6 +188,64 @@ class BVHMappingSettings(PropertyGroup):
         min=0.01,
         max=3.14159,
         subtype="ANGLE",
+    )
+    ik_iterations: IntProperty(
+        name="IK Iterations",
+        description="Maximum CCD iterations per kinematic chain and frame",
+        default=12,
+        min=1,
+        max=64,
+    )
+    ik_tolerance: FloatProperty(
+        name="IK Tolerance",
+        description="Stop the IK solve when the end-effector is closer than this distance to the target",
+        default=0.01,
+        min=0.0001,
+        max=0.25,
+        subtype="DISTANCE",
+    )
+    ik_max_step_angle: FloatProperty(
+        name="IK Max Step",
+        description="Maximum joint-angle change per CCD update to avoid unstable flips",
+        default=0.12,
+        min=0.005,
+        max=1.0,
+        subtype="ANGLE",
+    )
+    ik_target_scale: FloatProperty(
+        name="IK Target Scale",
+        description="Manual amplitude scale for BVH end-effector motion in kinematic IK",
+        default=1.0,
+        min=0.1,
+        max=2.0,
+    )
+    ik_proportion_blend: FloatProperty(
+        name="IK Proportion Blend",
+        description="Blend between absolute target matching (0) and proportion-scaled motion transfer (1)",
+        default=0.75,
+        min=0.0,
+        max=1.0,
+    )
+    ik_ground_lock_strength: FloatProperty(
+        name="IK Ground Lock",
+        description="For configured foot targets: keep vertical end-effector position close to calibrated ground pose while foot is grounded",
+        default=0.7,
+        min=0.0,
+        max=1.0,
+    )
+    ik_target_smoothing: FloatProperty(
+        name="IK Target Smoothing",
+        description="Low-pass filter on end-effector target positions",
+        default=0.25,
+        min=0.0,
+        max=1.0,
+    )
+    hybrid_ik_blend: FloatProperty(
+        name="Hybrid IK Blend",
+        description="Strength of IK correction on top of FK baseline (0 = FK only, 1 = full IK correction)",
+        default=0.5,
+        min=0.0,
+        max=1.0,
     )
 
     # Foot Contact & Anchoring

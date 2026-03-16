@@ -96,6 +96,30 @@ class UL_DefaultPoseJointList(UIList):
         row.prop(item, "angle", text="")
 
 
+class UL_KinematicChainList(UIList):
+    """List of configured kinematic target chains."""
+
+    def draw_item(
+        self,
+        context,
+        layout,
+        data,
+        item,
+        icon,
+        active_data,
+        active_propname,
+        index,
+    ):
+        """Draw a single kinematic chain row."""
+        row = layout.row(align=True)
+        label = item.label or item.bvh_target_bone_name or f"Chain {index + 1}"
+        row.label(text=label, icon="CON_KINEMATIC")
+        if item.urdf_root_bone_name and item.urdf_end_bone_name:
+            row.label(text=f"{item.urdf_root_bone_name} -> {item.urdf_end_bone_name}")
+        else:
+            row.label(text="Incomplete", icon="ERROR")
+
+
 class PANEL_RigSelection(Panel):
     """Panel for selecting URDF and BVH rigs."""
 
@@ -128,6 +152,8 @@ class PANEL_MotionOptions(Panel):
         layout = self.layout
         settings = context.scene.bvh_mapping_settings
 
+        layout.prop(settings, "retargeting_method")
+
         # Root motion control
         box = layout.box()
         box.label(text="Root Motion", icon="ARMATURE_DATA")
@@ -139,8 +165,29 @@ class PANEL_MotionOptions(Panel):
         box = layout.box()
         box.label(text="Smoothing", icon="MOD_SMOOTH")
         box.prop(settings, "bvh_smoothing", slider=True)
-        box.prop(settings, "joint_smoothing", slider=True)
-        box.prop(settings, "max_jump_threshold", slider=True)
+        if settings.retargeting_method == "ANGLE":
+            box.prop(settings, "joint_smoothing", slider=True)
+            box.prop(settings, "max_jump_threshold", slider=True)
+        elif settings.retargeting_method == "KINEMATIC":
+            box.prop(settings, "ik_target_smoothing", slider=True)
+            box.prop(settings, "ik_iterations")
+            box.prop(settings, "ik_tolerance")
+            box.prop(settings, "ik_max_step_angle", slider=True)
+            box.prop(settings, "ik_target_scale", slider=True)
+            box.prop(settings, "ik_proportion_blend", slider=True)
+            box.prop(settings, "ik_ground_lock_strength", slider=True)
+        else:
+            box.prop(settings, "joint_smoothing", slider=True)
+            box.prop(settings, "max_jump_threshold", slider=True)
+            box.separator()
+            box.prop(settings, "hybrid_ik_blend", slider=True)
+            box.prop(settings, "ik_target_smoothing", slider=True)
+            box.prop(settings, "ik_iterations")
+            box.prop(settings, "ik_tolerance")
+            box.prop(settings, "ik_max_step_angle", slider=True)
+            box.prop(settings, "ik_target_scale", slider=True)
+            box.prop(settings, "ik_proportion_blend", slider=True)
+            box.prop(settings, "ik_ground_lock_strength", slider=True)
 
 
 class PANEL_FootConfiguration(Panel):
@@ -229,6 +276,10 @@ class PANEL_BoneMapping(Panel):
         layout = self.layout
         settings = context.scene.bvh_mapping_settings
 
+        if settings.retargeting_method == "KINEMATIC":
+            layout.label(text="Bone mapping is used in Angle/Hybrid mode.", icon="INFO")
+            return
+
         # Generate mappings button
         layout.operator("object.generate_mapping_list", text="Generate Mapping List")
 
@@ -280,6 +331,82 @@ class PANEL_BoneMapping(Panel):
                 col.label(
                     text=f"Joint '{d}' is controlled multiple times", icon="BONE_DATA"
                 )
+
+
+class PANEL_KinematicChains(Panel):
+    """Panel for configuring BVH target to URDF IK chains."""
+
+    bl_label = "Kinematic Chains"
+    bl_idname = "VIEW3D_PT_urdf_kinematic_chains"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "BVH → URDF Retargeting"
+
+    def draw(self, context):
+        """Draw kinematic chain configuration panel."""
+        layout = self.layout
+        scene = context.scene
+        settings = scene.bvh_mapping_settings
+
+        if settings.retargeting_method == "ANGLE":
+            layout.label(
+                text="Kinematic chains are used in Kinematic/Hybrid mode.", icon="INFO"
+            )
+            return
+
+        row = layout.row()
+        row.template_list(
+            "UL_KinematicChainList",
+            "",
+            settings,
+            "kinematic_chains",
+            settings,
+            "active_kinematic_chain_index",
+        )
+        col = row.column(align=True)
+        col.operator("object.add_kinematic_chain", text="", icon="ADD")
+        col.operator("object.remove_kinematic_chain", text="", icon="REMOVE")
+
+        if 0 <= settings.active_kinematic_chain_index < len(settings.kinematic_chains):
+            chain = settings.kinematic_chains[settings.active_kinematic_chain_index]
+            box = layout.box()
+            box.prop(chain, "label")
+
+            if scene.bvh_rig_object:
+                box.prop_search(
+                    chain,
+                    "bvh_target_bone_name",
+                    scene.bvh_rig_object.pose,
+                    "bones",
+                    text="BVH Target",
+                )
+            else:
+                box.prop(chain, "bvh_target_bone_name")
+
+            if scene.urdf_rig_object:
+                box.prop_search(
+                    chain,
+                    "urdf_root_bone_name",
+                    scene.urdf_rig_object.pose,
+                    "bones",
+                    text="URDF Root",
+                )
+                box.prop_search(
+                    chain,
+                    "urdf_end_bone_name",
+                    scene.urdf_rig_object.pose,
+                    "bones",
+                    text="URDF End",
+                )
+            else:
+                box.prop(chain, "urdf_root_bone_name")
+                box.prop(chain, "urdf_end_bone_name")
+
+            box.prop(chain, "influence", slider=True)
+            layout.label(
+                text="Define chains from a URDF parent joint to an end-effector joint.",
+                icon="BONE_DATA",
+            )
 
 
 class PANEL_ApplyAndExport(Panel):

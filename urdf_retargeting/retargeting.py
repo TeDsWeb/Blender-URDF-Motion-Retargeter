@@ -33,6 +33,7 @@ Foot-planting uses a single-pass "persistent correction" approach:
 
 import bpy
 import math
+import hashlib
 import mathutils
 from bpy.app.handlers import persistent
 from .utils import (
@@ -111,7 +112,371 @@ def _find_urdf_foot_for_anchor(
         if item.bvh_bone_name == anchor_bone_name and item.urdf_bones:
             name = item.urdf_bones[-1].urdf_bone_name
             return urdf_obj.pose.bones.get(name)
+
+    for chain in settings.kinematic_chains:
+        if chain.bvh_target_bone_name == anchor_bone_name and chain.urdf_end_bone_name:
+            return urdf_obj.pose.bones.get(chain.urdf_end_bone_name)
+
     return None
+
+
+def _get_pose_bone_world_position(
+    armature_obj: bpy.types.Object,
+    pose_bone: bpy.types.PoseBone,
+) -> mathutils.Vector:
+    """Return the world-space joint position of a pose bone."""
+    return (armature_obj.matrix_world @ pose_bone.matrix).to_translation()
+
+
+def _get_pose_bone_world_axis(
+    armature_obj: bpy.types.Object,
+    pose_bone: bpy.types.PoseBone,
+) -> mathutils.Vector:
+    """Return the world-space joint axis for a URDF pose bone."""
+    bone_world_q = (armature_obj.matrix_world @ pose_bone.matrix).to_quaternion()
+    axis = bone_world_q @ mathutils.Vector((0, 1, 0))
+    if axis.length_squared == 0.0:
+        return mathutils.Vector((0, 1, 0))
+    return axis.normalized()
+
+
+def _build_urdf_chain(
+    urdf_obj: bpy.types.Object,
+    root_bone_name: str,
+    end_bone_name: str,
+) -> list[bpy.types.PoseBone]:
+    """Build a serial URDF pose-bone chain from root to end bone."""
+    root_bone = urdf_obj.pose.bones.get(root_bone_name)
+    end_bone = urdf_obj.pose.bones.get(end_bone_name)
+    if not root_bone or not end_bone:
+        return []
+
+    chain = []
+    current = end_bone
+    while current is not None:
+        chain.append(current)
+        if current.name == root_bone.name:
+            return list(reversed(chain))
+        current = current.parent
+
+    return []
+
+
+def _signed_angle_around_axis(
+    source: mathutils.Vector,
+    target: mathutils.Vector,
+    axis: mathutils.Vector,
+) -> float:
+    """Return signed angle from source to target around axis."""
+    cross = source.cross(target)
+    dot = max(-1.0, min(1.0, source.dot(target)))
+    return math.atan2(axis.dot(cross), dot)
+
+
+def _smooth_target_position(
+    cache: dict,
+    cache_key: str,
+    target_world: mathutils.Vector,
+    smoothing_factor: float,
+    initial_value: mathutils.Vector | None = None,
+) -> mathutils.Vector:
+    """Apply EMA-like smoothing to world-space IK targets."""
+    if cache_key not in cache and initial_value is not None:
+        cache[cache_key] = initial_value.copy()
+
+    if cache_key in cache:
+        last_target = mathutils.Vector(cache[cache_key])
+        # Keep a small minimum alpha so the target never fully freezes,
+        # even if the user sets smoothing close to 1.0.
+        alpha = max(0.02, 1.0 - smoothing_factor)
+        target_world = last_target.lerp(target_world, alpha)
+
+    cache[cache_key] = target_world.copy()
+    return target_world
+
+
+def _short_cache_id(*parts: str) -> str:
+    """Return a short deterministic IDProperty-safe key suffix."""
+    payload = "|".join(parts).encode("utf-8", errors="ignore")
+    return hashlib.blake2b(payload, digest_size=8).hexdigest()
+
+
+def _compute_custom_default_end_local(
+    urdf_obj: bpy.types.Object,
+    settings,
+    end_bone_name: str,
+) -> mathutils.Vector | None:
+    """Evaluate end-effector local position in custom default pose."""
+    if not settings.use_custom_default_pose:
+        return None
+
+    end_bone = urdf_obj.pose.bones.get(end_bone_name)
+    if not end_bone:
+        return None
+
+    joint_defaults = {
+        item.joint_name: item.angle
+        for item in getattr(settings, "default_pose_joints", [])
+    }
+    if not joint_defaults:
+        return None
+
+    prev_root_q = urdf_obj.rotation_quaternion.copy()
+    prev_bone_q = {}
+
+    for pb in urdf_obj.pose.bones:
+        prev_bone_q[pb.name] = pb.rotation_quaternion.copy()
+
+    try:
+        urdf_obj.rotation_mode = "QUATERNION"
+        root_euler = mathutils.Euler(settings.default_pose_root_rotation, "XYZ")
+        urdf_obj.rotation_quaternion = root_euler.to_quaternion()
+
+        for joint_name, angle in joint_defaults.items():
+            pb = urdf_obj.pose.bones.get(joint_name)
+            if not pb:
+                continue
+
+            jtype = get_bone_property(pb, "joint_type", "revolute")
+            if jtype not in {"revolute", "continuous"}:
+                continue
+
+            if jtype != "continuous":
+                l_min = get_bone_property(pb, "limit_lower", -3.14)
+                l_max = get_bone_property(pb, "limit_upper", 3.14)
+                angle = clamp_to_limits(angle, l_min, l_max)
+
+            pb.rotation_mode = "QUATERNION"
+            pb.rotation_quaternion = mathutils.Quaternion((0, 1, 0), angle)
+
+        bpy.context.view_layer.update()
+        return end_bone.matrix.to_translation().copy()
+    finally:
+        urdf_obj.rotation_quaternion = prev_root_q
+        for pb in urdf_obj.pose.bones:
+            if pb.name in prev_bone_q:
+                pb.rotation_quaternion = prev_bone_q[pb.name]
+        bpy.context.view_layer.update()
+
+
+def apply_custom_default_pose_to_urdf(
+    urdf_obj: bpy.types.Object,
+    settings,
+) -> bool:
+    """Apply stored custom default pose values to the current URDF rig."""
+    if not settings.use_custom_default_pose:
+        return False
+
+    joint_defaults = {
+        item.joint_name: item.angle
+        for item in getattr(settings, "default_pose_joints", [])
+    }
+    if not joint_defaults:
+        return False
+
+    urdf_obj.rotation_mode = "QUATERNION"
+    root_euler = mathutils.Euler(settings.default_pose_root_rotation, "XYZ")
+    urdf_obj.rotation_quaternion = root_euler.to_quaternion()
+
+    for joint_name, target_angle in joint_defaults.items():
+        pb = urdf_obj.pose.bones.get(joint_name)
+        if not pb:
+            continue
+
+        joint_type = get_bone_property(pb, "joint_type", "revolute")
+        if joint_type not in {"revolute", "continuous"}:
+            continue
+
+        _apply_final_angle(pb, target_angle, joint_type)
+        set_bone_property(
+            pb, "_last_urdf_angle", get_bone_property(pb, "_joint_angle", 0.0)
+        )
+
+    bpy.context.view_layer.update()
+    return True
+
+
+def apply_kinematic_retargeting(
+    urdf_obj: bpy.types.Object,
+    bvh_obj: bpy.types.Object,
+    settings,
+    scene: bpy.types.Scene,
+    correction_blend: float = 1.0,
+) -> None:
+    """Retarget URDF joint chains by solving BVH end-effector targets with CCD IK."""
+    if "_kinematic_target_cache" not in scene:
+        scene["_kinematic_target_cache"] = {}
+    target_cache = scene["_kinematic_target_cache"]
+
+    bvh_root_mat = bvh_obj.matrix_world @ bvh_obj.pose.bones[0].matrix
+
+    for chain in settings.kinematic_chains:
+        if not chain.bvh_target_bone_name or not chain.urdf_end_bone_name:
+            continue
+
+        bvh_target_bone = bvh_obj.pose.bones.get(chain.bvh_target_bone_name)
+        if not bvh_target_bone:
+            continue
+
+        full_chain = _build_urdf_chain(
+            urdf_obj,
+            chain.urdf_root_bone_name,
+            chain.urdf_end_bone_name,
+        )
+        if not full_chain:
+            continue
+
+        solver_bones = [
+            bone
+            for bone in full_chain
+            if get_bone_property(bone, "joint_type", "revolute")
+            in {"revolute", "continuous"}
+        ]
+        if not solver_bones:
+            continue
+
+        end_bone = full_chain[-1]
+        bvh_target_world = _get_pose_bone_world_position(bvh_obj, bvh_target_bone)
+        target_local = bvh_root_mat.inverted() @ bvh_target_world
+        end_world_now = _get_pose_bone_world_position(urdf_obj, end_bone)
+        end_local_now = urdf_obj.matrix_world.inverted() @ end_world_now
+
+        chain_key = _short_cache_id(
+            bvh_obj.name,
+            chain.bvh_target_bone_name,
+            chain.urdf_root_bone_name,
+            chain.urdf_end_bone_name,
+        )
+        ref_urdf_key = f"ik_r_u_{chain_key}"
+        ref_bvh_key = f"ik_r_b_{chain_key}"
+
+        if ref_urdf_key not in target_cache:
+            custom_ref = _compute_custom_default_end_local(
+                urdf_obj,
+                settings,
+                chain.urdf_end_bone_name,
+            )
+            target_cache[ref_urdf_key] = (
+                custom_ref.copy() if custom_ref is not None else end_local_now.copy()
+            )
+        if ref_bvh_key not in target_cache:
+            target_cache[ref_bvh_key] = target_local.copy()
+
+        ref_urdf_local = mathutils.Vector(target_cache[ref_urdf_key])
+        ref_bvh_local = mathutils.Vector(target_cache[ref_bvh_key])
+
+        # Absolute target with calibration offset keeps frame-0 alignment.
+        calibration_offset = ref_urdf_local - ref_bvh_local
+        absolute_target = target_local + calibration_offset
+
+        # Proportion-scaled motion target transfers BVH motion with chain-size compensation.
+        bvh_ref_radius = max(ref_bvh_local.length, 1e-6)
+        urdf_ref_radius = ref_urdf_local.length
+        proportion_scale = urdf_ref_radius / bvh_ref_radius
+        scaled_motion_target = ref_urdf_local + (
+            (target_local - ref_bvh_local) * proportion_scale * settings.ik_target_scale
+        )
+
+        # Blend both strategies for robust behavior across very different body proportions.
+        desired_local = absolute_target.lerp(
+            scaled_motion_target,
+            settings.ik_proportion_blend,
+        )
+
+        # Keep planted feet close to custom/default URDF reference height.
+        if chain.bvh_target_bone_name in {settings.foot_l_name, settings.foot_r_name}:
+            bvh_floor_offset = scene.get("bvh_floor_offset", 0.0)
+            foot_height = bvh_target_world.z - bvh_floor_offset
+            if foot_height <= settings.jump_threshold:
+                lock = settings.ik_ground_lock_strength
+                desired_local.z = (
+                    1.0 - lock
+                ) * desired_local.z + lock * ref_urdf_local.z
+
+        target_world = urdf_obj.matrix_world @ desired_local
+
+        # Clamp target distance to reachable chain length to avoid solver instability.
+        chain_root_world = _get_pose_bone_world_position(urdf_obj, full_chain[0])
+        chain_reach = 0.0
+        for i in range(1, len(full_chain)):
+            a = _get_pose_bone_world_position(urdf_obj, full_chain[i - 1])
+            b = _get_pose_bone_world_position(urdf_obj, full_chain[i])
+            chain_reach += (b - a).length
+
+        to_target = target_world - chain_root_world
+        if chain_reach > 1e-6 and to_target.length > chain_reach:
+            target_world = chain_root_world + to_target.normalized() * chain_reach
+
+        cache_key = f"ik_t_{chain_key}"
+        target_world = _smooth_target_position(
+            target_cache,
+            cache_key,
+            target_world,
+            settings.ik_target_smoothing,
+            initial_value=end_world_now,
+        )
+
+        for pose_bone in solver_bones:
+            pose_bone.rotation_mode = "QUATERNION"
+
+        for _ in range(settings.ik_iterations):
+            bpy.context.view_layer.update()
+            end_world = _get_pose_bone_world_position(urdf_obj, end_bone)
+            dist_error = (target_world - end_world).length
+            if dist_error <= settings.ik_tolerance:
+                break
+
+            made_progress = False
+            for pose_bone in reversed(solver_bones):
+                joint_world = _get_pose_bone_world_position(urdf_obj, pose_bone)
+                end_world = _get_pose_bone_world_position(urdf_obj, end_bone)
+                to_end = end_world - joint_world
+                to_target = target_world - joint_world
+
+                if to_end.length_squared < 1e-12 or to_target.length_squared < 1e-12:
+                    continue
+
+                axis_world = _get_pose_bone_world_axis(urdf_obj, pose_bone)
+                end_proj = to_end - axis_world * to_end.dot(axis_world)
+                target_proj = to_target - axis_world * to_target.dot(axis_world)
+
+                if (
+                    end_proj.length_squared < 1e-12
+                    or target_proj.length_squared < 1e-12
+                ):
+                    continue
+
+                angle_delta = _signed_angle_around_axis(
+                    end_proj.normalized(),
+                    target_proj.normalized(),
+                    axis_world,
+                )
+                angle_delta *= chain.influence
+                angle_delta *= correction_blend
+                angle_delta = clamp_to_limits(
+                    angle_delta,
+                    -settings.ik_max_step_angle,
+                    settings.ik_max_step_angle,
+                )
+                # For very small numeric angles, apply a tiny signed nudge if
+                # the end-effector is still far from target to avoid stalling.
+                if abs(angle_delta) < 1e-5 and dist_error > settings.ik_tolerance * 4.0:
+                    sign = (
+                        1.0 if axis_world.dot(to_end.cross(to_target)) >= 0.0 else -1.0
+                    )
+                    angle_delta = sign * min(settings.ik_max_step_angle, 0.01)
+
+                if abs(angle_delta) < 1e-7:
+                    continue
+
+                joint_type = get_bone_property(pose_bone, "joint_type", "revolute")
+                current_angle = get_bone_property(pose_bone, "_joint_angle", 0.0)
+                _apply_final_angle(pose_bone, current_angle + angle_delta, joint_type)
+                made_progress = True
+                bpy.context.view_layer.update()
+
+            if not made_progress:
+                break
 
 
 def get_lowest_z_world(urdf_obj: bpy.types.Object) -> float:
@@ -372,6 +737,15 @@ def apply_foot_alignment(
             ]
             bvh_to_urdf_map[item.bvh_bone_name] = urdf_data
 
+    for chain in settings.kinematic_chains:
+        if (
+            chain.bvh_target_bone_name in [settings.foot_l_name, settings.foot_r_name]
+            and chain.urdf_end_bone_name
+        ):
+            bvh_to_urdf_map.setdefault(chain.bvh_target_bone_name, []).append(
+                (chain.urdf_end_bone_name, False)
+            )
+
     for bvh_foot_name in [settings.foot_l_name, settings.foot_r_name]:
         if bvh_foot_name not in bvh_to_urdf_map:
             continue
@@ -542,10 +916,23 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     urdf.rotation_quaternion = persistent_rot_correction @ off_q @ delta_rot
 
     # ------------------------------------------------------------------
-    # 3.  Joint retargeting  (FK)
+    # 3.  Joint retargeting  (angle extraction or kinematic IK)
     # ------------------------------------------------------------------
-    for item in settings.mappings:
-        apply_joint_retargeting(urdf, bvh, item, smooth_cache, settings, scene)
+    if settings.retargeting_method == "KINEMATIC":
+        apply_kinematic_retargeting(urdf, bvh, settings, scene)
+    elif settings.retargeting_method == "HYBRID":
+        for item in settings.mappings:
+            apply_joint_retargeting(urdf, bvh, item, smooth_cache, settings, scene)
+        apply_kinematic_retargeting(
+            urdf,
+            bvh,
+            settings,
+            scene,
+            correction_blend=settings.hybrid_ik_blend,
+        )
+    else:
+        for item in settings.mappings:
+            apply_joint_retargeting(urdf, bvh, item, smooth_cache, settings, scene)
 
     # ------------------------------------------------------------------
     # 4.  Foot alignment  (flatten near ground)

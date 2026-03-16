@@ -13,7 +13,7 @@ from bpy_extras.io_utils import ImportHelper
 from bpy_extras.anim_utils import action_get_channelbag_for_slot
 from .urdf import parse_urdf
 from .armature import create_urdf_armature, bind_meshes
-from .retargeting import get_lowest_z_world
+from .retargeting import get_lowest_z_world, apply_custom_default_pose_to_urdf
 
 
 class OT_GenerateMappingList(Operator):
@@ -219,10 +219,15 @@ class OT_ApplyBVHMapping(Operator):
         # Clear only per-frame transient state keys (not calibration keys)
         for _k in (
             "_persistent_foot_correction",
+            "_persistent_foot_rot_correction",
             "_active_anchor_name",
             "_anchor_world_pos_xy",
+            "_anchor_world_yaw",
+            "_anchor_bvh_yaw",
             "_foot_positions",
             "_bvh_smooth_cache",
+            "_kinematic_target_cache",
+            "_ik_custom_default_ref_cache",
         ):
             if _k in scene:
                 del scene[_k]
@@ -268,6 +273,10 @@ class OT_ApplyBVHMapping(Operator):
             )
         else:
             scene.smoothed_bvh_rig_object = bvh_obj
+
+        # Ensure retargeting starts from the same pose definition used by export
+        # to avoid mismatched IK references when custom defaults are enabled.
+        apply_custom_default_pose_to_urdf(urdf_obj, settings)
 
         # Initialize export frame range defaults (only in operator context)
         try:
@@ -417,6 +426,40 @@ class OT_RemoveBVHBone(Operator):
             if i.bvh_bone_name == self.bvh_bone_name
         )
         m.urdf_bones.remove(context.scene.bvh_mapping_settings.active_urdf_index)
+        return {"FINISHED"}
+
+
+class OT_AddKinematicChain(Operator):
+    """Add a new kinematic IK chain definition."""
+
+    bl_idname = "object.add_kinematic_chain"
+    bl_label = "Add Kinematic Chain"
+    bl_description = "Add a BVH target to URDF chain mapping for IK retargeting"
+
+    def execute(self, context):
+        settings = context.scene.bvh_mapping_settings
+        chain = settings.kinematic_chains.add()
+        chain.label = f"Chain {len(settings.kinematic_chains)}"
+        settings.active_kinematic_chain_index = len(settings.kinematic_chains) - 1
+        return {"FINISHED"}
+
+
+class OT_RemoveKinematicChain(Operator):
+    """Remove the selected kinematic IK chain definition."""
+
+    bl_idname = "object.remove_kinematic_chain"
+    bl_label = "Remove Kinematic Chain"
+    bl_description = "Remove the selected BVH target to URDF chain mapping"
+
+    def execute(self, context):
+        settings = context.scene.bvh_mapping_settings
+        if not settings.kinematic_chains:
+            return {"CANCELLED"}
+
+        index = settings.active_kinematic_chain_index
+        index = max(0, min(index, len(settings.kinematic_chains) - 1))
+        settings.kinematic_chains.remove(index)
+        settings.active_kinematic_chain_index = max(0, index - 1)
         return {"FINISHED"}
 
 

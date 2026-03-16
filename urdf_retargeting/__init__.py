@@ -36,6 +36,7 @@ from bpy.props import PointerProperty
 from .data_structures import (
     BVHMappingBone,
     BVHMappingItem,
+    KinematicChainMapping,
     DefaultPoseJoint,
     BVHMappingSettings,
 )
@@ -43,10 +44,12 @@ from .ui import (
     UL_BVHMappingList,
     UL_URDFBoneList,
     UL_DefaultPoseJointList,
+    UL_KinematicChainList,
     PANEL_RigSelection,
     PANEL_MotionOptions,
     PANEL_FootConfiguration,
     PANEL_BoneMapping,
+    PANEL_KinematicChains,
     PANEL_ApplyAndExport,
 )
 from .operators import (
@@ -55,6 +58,8 @@ from .operators import (
     OT_CalibrateRestPose,
     OT_AddBVHBone,
     OT_RemoveBVHBone,
+    OT_AddKinematicChain,
+    OT_RemoveKinematicChain,
     OT_ClearScene,
     IMPORT_OT_urdf_humanoid,
     menu_func_import,
@@ -74,16 +79,19 @@ classes = [
     # Data structures
     BVHMappingBone,
     BVHMappingItem,
+    KinematicChainMapping,
     DefaultPoseJoint,
     BVHMappingSettings,
     # UI
     UL_BVHMappingList,
     UL_URDFBoneList,
     UL_DefaultPoseJointList,
+    UL_KinematicChainList,
     PANEL_RigSelection,
     PANEL_MotionOptions,
     PANEL_FootConfiguration,
     PANEL_BoneMapping,
+    PANEL_KinematicChains,
     PANEL_ApplyAndExport,
     # Operators
     OT_GenerateMappingList,
@@ -91,6 +99,8 @@ classes = [
     OT_CalibrateRestPose,
     OT_AddBVHBone,
     OT_RemoveBVHBone,
+    OT_AddKinematicChain,
+    OT_RemoveKinematicChain,
     OT_ClearScene,
     IMPORT_OT_urdf_humanoid,
     OT_CaptureDefaultPoseFromCurrent,
