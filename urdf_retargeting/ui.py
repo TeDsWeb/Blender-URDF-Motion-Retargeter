@@ -180,6 +180,12 @@ class PANEL_MotionOptions(Panel):
             if settings.hybrid_realtime_guard:
                 perf_box.prop(settings, "hybrid_min_iterations")
             perf_box.prop(settings, "hybrid_ik_frame_skip")
+            perf_box.prop(settings, "quality_ik_iterations")
+            perf_box.separator()
+            perf_box.prop(settings, "bake_watchdog_enabled")
+            if settings.bake_watchdog_enabled:
+                perf_box.prop(settings, "bake_watchdog_frame_ms")
+                perf_box.prop(settings, "bake_watchdog_abort")
 
         # --- Telemetry ---
         avg_ms = context.scene.get("_retarget_ms_ema", None)
@@ -475,7 +481,12 @@ class PANEL_ApplyAndExport(Panel):
 
         box = layout.box()
         box.label(text="Retargeting", icon="PLAY")
-        box.operator("object.apply_bvh_mapping", text="Apply Mapping")
+        row = box.row(align=True)
+        row.operator("object.apply_bvh_mapping", text="Apply Mapping")
+        row.operator("object.bake_bvh_mapping", text="Bake Retarget", icon="REC")
+        box.prop(settings, "precompute_on_apply")
+        if settings.precompute_on_apply:
+            box.prop(settings, "precompute_disable_live_after_apply")
 
         box = layout.box()
         box.label(text="Export", icon="EXPORT")

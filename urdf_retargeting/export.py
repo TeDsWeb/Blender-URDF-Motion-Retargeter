@@ -178,6 +178,7 @@ class OT_ExportBeyondMimic(Operator):
     _blend_out_seconds = 0.0
     _end_pose_hold_seconds = 0.0
     _phase = 1
+    _orig_ik_iterations = 0
 
     def modal(self, context, event):
         """Modal handler — Pass 1: evaluate every frame sequentially.
@@ -308,10 +309,14 @@ class OT_ExportBeyondMimic(Operator):
         self._data_rows = []
         self._meta_joints = {}
         self._orig_frame = scene.frame_current
+        self._orig_ik_iterations = int(getattr(settings, "ik_iterations", 12))
         self._phase = 1
 
         # Export should always evaluate the full-quality retarget path.
         scene["_export_full_quality"] = True
+        settings.ik_iterations = int(
+            getattr(settings, "quality_ik_iterations", self._orig_ik_iterations)
+        )
 
         # Start modal loop — progress tracks frame evaluation
         wm = context.window_manager
@@ -645,13 +650,20 @@ class OT_ExportBeyondMimic(Operator):
 
     def cleanup(self, context):
         """Clean up modal state and restore scene."""
+        settings = context.scene.bvh_mapping_settings
         if "_export_full_quality" in context.scene:
             del context.scene["_export_full_quality"]
+        settings.ik_iterations = self._orig_ik_iterations
         context.scene.frame_set(self._orig_frame)
         context.window_manager.event_timer_remove(self._timer)
         context.window_manager.progress_end()
         context.workspace.status_text_set(None)
-        bpy.ops.object.apply_bvh_mapping()  # Restore retargeting state
+        context.scene["_skip_apply_precompute"] = True
+        try:
+            bpy.ops.object.apply_bvh_mapping()  # Restore retargeting state
+        finally:
+            if "_skip_apply_precompute" in context.scene:
+                del context.scene["_skip_apply_precompute"]
 
     def invoke(self, context, event):
         """Open file browser for directory selection."""
@@ -669,5 +681,10 @@ class OT_ExportBeyondMimic(Operator):
                 settings, "export_end_pose_hold_seconds", 0.0
             )
         context.window_manager.fileselect_add(self)
-        bpy.ops.object.apply_bvh_mapping()  # Ensure final retarget before export
+        context.scene["_skip_apply_precompute"] = True
+        try:
+            bpy.ops.object.apply_bvh_mapping()  # Ensure final retarget before export
+        finally:
+            if "_skip_apply_precompute" in context.scene:
+                del context.scene["_skip_apply_precompute"]
         return {"RUNNING_MODAL"}

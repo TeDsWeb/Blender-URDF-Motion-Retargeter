@@ -56,6 +56,7 @@ from .ui import (
 from .operators import (
     OT_GenerateMappingList,
     OT_ApplyBVHMapping,
+    OT_BakeRetargetedMotion,
     OT_CalibrateRestPose,
     OT_AddBVHBone,
     OT_RemoveBVHBone,
@@ -102,6 +103,7 @@ classes = [
     # Operators
     OT_GenerateMappingList,
     OT_ApplyBVHMapping,
+    OT_BakeRetargetedMotion,
     OT_CalibrateRestPose,
     OT_AddBVHBone,
     OT_RemoveBVHBone,

@@ -211,6 +211,16 @@ class BVHMappingSettings(PropertyGroup):
         description="Enable real-time retargeting on frame changes",
         default=False,
     )
+    precompute_on_apply: BoolProperty(
+        name="Precompute on Apply",
+        description="Bake the retargeted motion into keyframes when Apply Mapping is pressed",
+        default=False,
+    )
+    precompute_disable_live_after_apply: BoolProperty(
+        name="Disable Live After Precompute",
+        description="Turn off live retargeting after precompute so playback uses baked keyframes only",
+        default=True,
+    )
     retargeting_method: EnumProperty(
         name="Retargeting Method",
         description="Select the retargeting backend (ANGLE/KINEMATIC are legacy and mapped to HYBRID at runtime)",
@@ -293,6 +303,30 @@ class BVHMappingSettings(PropertyGroup):
         default=12,
         min=1,
         max=64,
+    )
+    quality_ik_iterations: IntProperty(
+        name="Offline IK Iterations",
+        description="IK iterations used for offline quality passes (Bake and Export)",
+        default=64,
+        min=1,
+        max=64,
+    )
+    bake_watchdog_enabled: BoolProperty(
+        name="Bake Watchdog",
+        description="Detect very slow bake frames and warn in the status/progress output",
+        default=True,
+    )
+    bake_watchdog_frame_ms: FloatProperty(
+        name="Watchdog Frame Limit (ms)",
+        description="Warn (or optionally abort) when a single baked frame exceeds this duration",
+        default=250.0,
+        min=10.0,
+        max=10000.0,
+    )
+    bake_watchdog_abort: BoolProperty(
+        name="Abort On Watchdog",
+        description="Abort bake when a single frame exceeds the watchdog frame limit",
+        default=False,
     )
     ik_tolerance: FloatProperty(
         name="IK Tolerance",
