@@ -36,8 +36,8 @@ class OT_CaptureDefaultPoseFromCurrent(Operator):
     """Capture the current URDF pose as editable custom default pose."""
 
     bl_idname = "object.capture_default_pose_from_current"
-    bl_label = "Capture Default Pose"
-    bl_description = "Capture current URDF root rotation and joint angles into custom default pose settings"
+    bl_label = "Capture Neutral Pose"
+    bl_description = "Capture current URDF root rotation and joint angles into the stored neutral pose"
 
     def execute(self, context):
         scene = context.scene
@@ -71,7 +71,7 @@ class OT_CaptureDefaultPoseFromCurrent(Operator):
 
         self.report(
             {"INFO"},
-            f"Custom default pose captured ({len(settings.default_pose_joints)} joints)",
+            f"Neutral pose captured ({len(settings.default_pose_joints)} joints)",
         )
         return {"FINISHED"}
 
@@ -80,16 +80,18 @@ class OT_ResetDefaultPose(Operator):
     """Reset and disable custom default pose settings."""
 
     bl_idname = "object.reset_default_pose"
-    bl_label = "Reset Default Pose"
-    bl_description = "Disable custom default pose and clear editable values"
+    bl_label = "Reset Neutral Pose"
+    bl_description = (
+        "Clear the stored neutral pose values and reset them to neutral defaults"
+    )
 
     def execute(self, context):
         settings = context.scene.bvh_mapping_settings
-        settings.use_custom_default_pose = False
+        settings.use_custom_default_pose = True
         settings.default_pose_root_rotation = (0.0, 0.0, 0.0)
         settings.default_pose_joints.clear()
         settings.default_pose_active_index = 0
-        self.report({"INFO"}, "Custom default pose reset")
+        self.report({"INFO"}, "Neutral pose reset")
         return {"FINISHED"}
 
 
@@ -97,8 +99,8 @@ class OT_SyncDefaultPoseJoints(Operator):
     """Sync editable default-pose joint list from URDF joint order."""
 
     bl_idname = "object.sync_default_pose_joints"
-    bl_label = "Sync Default Pose Joints"
-    bl_description = "Refresh default pose joint list from URDF joint order while preserving existing edited values"
+    bl_label = "Sync Neutral Pose Joints"
+    bl_description = "Refresh neutral pose joint list from URDF joint order while preserving existing edited values"
 
     def execute(self, context):
         scene = context.scene
@@ -115,7 +117,7 @@ class OT_SyncDefaultPoseJoints(Operator):
 
         self.report(
             {"INFO"},
-            f"Default pose joint list synced ({len(settings.default_pose_joints)} joints)",
+            f"Neutral pose joint list synced ({len(settings.default_pose_joints)} joints)",
         )
         return {"FINISHED"}
 
@@ -142,13 +144,13 @@ class OT_ExportBeyondMimic(Operator):
     )
     default_pose_blend_in_seconds: bpy.props.FloatProperty(
         name="Blend In (s)",
-        description="Duration in seconds to blend from default pose into motion",
+        description="Duration in seconds to blend from neutral pose into motion",
         default=0.0,
         min=0.0,
     )
     default_pose_blend_out_seconds: bpy.props.FloatProperty(
         name="Blend Out (s)",
-        description="Duration in seconds to blend from motion back to default pose",
+        description="Duration in seconds to blend from motion back to neutral pose",
         default=0.0,
         min=0.0,
     )
@@ -239,7 +241,7 @@ class OT_ExportBeyondMimic(Operator):
 
             elif self._phase == 3:
                 context.workspace.status_text_set(
-                    "Export Pass 3/4: Blending default pose…"
+                    "Export Pass 3/4: Blending neutral pose…"
                 )
                 self._data_rows = self._apply_default_pose_blends(
                     scene, urdf, self._data_rows
@@ -406,26 +408,12 @@ class OT_ExportBeyondMimic(Operator):
         else:
             ref_pos = mathutils.Vector(scene.get("ref_root_pos", urdf.location))
 
-        if settings.use_custom_default_pose:
-            ref_rot = mathutils.Euler(
-                settings.default_pose_root_rotation, "XYZ"
-            ).to_quaternion()
-            custom_joint_angles = {
-                item.joint_name: item.angle for item in settings.default_pose_joints
-            }
-        else:
-            ref_rot = mathutils.Quaternion(
-                scene.get(
-                    "ref_root_rot",
-                    (
-                        urdf.rotation_quaternion.w,
-                        urdf.rotation_quaternion.x,
-                        urdf.rotation_quaternion.y,
-                        urdf.rotation_quaternion.z,
-                    ),
-                )
-            )
-            custom_joint_angles = {}
+        # Neutral root yaw is intentionally not user-editable.
+        base_r = settings.default_pose_root_rotation
+        ref_rot = mathutils.Euler((base_r[0], base_r[1], 0.0), "XYZ").to_quaternion()
+        custom_joint_angles = {
+            item.joint_name: item.angle for item in settings.default_pose_joints
+        }
 
         if root_motion_quat_override is not None:
             motion_q = mathutils.Quaternion(

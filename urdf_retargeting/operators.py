@@ -60,6 +60,49 @@ class OT_ApplyBVHMapping(Operator):
     bl_label = "Apply Mapping"
     bl_description = "Resets rig to neutral pose at frame 0 and starts live retargeting"
 
+    def _validate_required_fields(self, settings, bvh_obj: bpy.types.Object) -> bool:
+        """Validate mandatory fields before enabling live retargeting."""
+        missing_fields = []
+
+        if not settings.foot_l_name:
+            missing_fields.append("Foot Configuration -> Left Foot")
+        if not settings.foot_r_name:
+            missing_fields.append("Foot Configuration -> Right Foot")
+
+        if missing_fields:
+            self.report(
+                {"WARNING"},
+                "Apply Mapping cancelled: required fields are missing: "
+                + ", ".join(missing_fields),
+            )
+            return False
+
+        invalid_bones = []
+        if bvh_obj.pose.bones.get(settings.foot_l_name) is None:
+            invalid_bones.append(
+                f"Left Foot '{settings.foot_l_name}' was not found in the BVH rig"
+            )
+        if bvh_obj.pose.bones.get(settings.foot_r_name) is None:
+            invalid_bones.append(
+                f"Right Foot '{settings.foot_r_name}' was not found in the BVH rig"
+            )
+
+        if invalid_bones:
+            self.report(
+                {"WARNING"},
+                "Apply Mapping cancelled: " + "; ".join(invalid_bones),
+            )
+            return False
+
+        if settings.foot_l_name == settings.foot_r_name:
+            self.report(
+                {"WARNING"},
+                "Apply Mapping cancelled: Left Foot and Right Foot must be different bones.",
+            )
+            return False
+
+        return True
+
     def check_bvh_rotation_mode(self, bvh_obj: bpy.types.Object) -> bool:
         """
         Check if all BVH bones use QUATERNION rotation mode.
@@ -218,6 +261,9 @@ class OT_ApplyBVHMapping(Operator):
 
         if not urdf_obj or not bvh_obj:
             self.report({"ERROR"}, "URDF and BVH rigs must be selected!")
+            return {"CANCELLED"}
+
+        if not self._validate_required_fields(settings, bvh_obj):
             return {"CANCELLED"}
 
         # Disable retargeting during setup
@@ -392,9 +438,21 @@ class OT_CalibrateRestPose(Operator):
             if scene.get("urdf_height_offset", None) is None:
                 scene["urdf_height_offset"] = abs(get_lowest_z_world(urdf))
         else:
-            # Warning if foot bones are not found
-            self.report({"Error"}, "Foot bones not found for floor offset calculation")
-            return {"CANCELLED"}
+            # Fallback without foot anchors so operator never crashes on missing setup.
+            if scene.get("bvh_floor_offset", None) is None:
+                lowest_bvh_z = min(
+                    (bvh.matrix_world @ pb.matrix).to_translation().z
+                    for pb in bvh.pose.bones
+                )
+                scene["bvh_floor_offset"] = lowest_bvh_z
+            if scene.get("urdf_height_offset", None) is None:
+                scene["urdf_height_offset"] = abs(get_lowest_z_world(urdf))
+
+            self.report(
+                {"WARNING"},
+                "Foot Configuration is incomplete or invalid. "
+                "Using generic floor offsets; configure Left/Right Foot bones for stable foot contact.",
+            )
 
         self.report({"INFO"}, f"Calibrated {count} bones. Reference set.")
         return {"FINISHED"}

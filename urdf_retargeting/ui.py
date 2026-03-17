@@ -247,20 +247,25 @@ class PANEL_BoneMapping(Panel):
     bl_category = "BVH -> URDF Retargeting"
 
     def check_duplicate_mappings(self, context):
-        """Check for duplicate URDF bone assignments."""
+        """Check for duplicate URDF bone assignments within bone mappings only."""
         settings = context.scene.bvh_mapping_settings
         used_urdf_bones = {}
         duplicates = []
+
+        def _register_assignment(name, source_name):
+            if not name:
+                return
+            if name in used_urdf_bones:
+                used_urdf_bones[name].append(source_name)
+                if name not in duplicates:
+                    duplicates.append(name)
+            else:
+                used_urdf_bones[name] = [source_name]
+
         for item in settings.mappings:
             for u_bone in item.urdf_bones:
-                name = u_bone.urdf_bone_name
-                if name:
-                    if name in used_urdf_bones:
-                        used_urdf_bones[name].append(item.bvh_bone_name)
-                        if name not in duplicates:
-                            duplicates.append(name)
-                    else:
-                        used_urdf_bones[name] = [item.bvh_bone_name]
+                _register_assignment(u_bone.urdf_bone_name, item.bvh_bone_name)
+
         return duplicates, used_urdf_bones
 
     def draw(self, context):
@@ -395,9 +400,9 @@ class PANEL_KinematicChains(Panel):
 
 
 class PANEL_DefaultPose(Panel):
-    """Panel for configuring the optional custom default pose."""
+    """Panel for configuring the stored neutral pose."""
 
-    bl_label = "Default Pose"
+    bl_label = "Neutral Pose"
     bl_idname = "VIEW3D_PT_urdf_default_pose"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -405,56 +410,53 @@ class PANEL_DefaultPose(Panel):
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
-        """Draw default pose configuration panel."""
+        """Draw neutral pose configuration panel."""
         layout = self.layout
         settings = context.scene.bvh_mapping_settings
 
         box = layout.box()
-        box.prop(settings, "use_custom_default_pose", text="Use Custom Default Pose")
-
-        if settings.use_custom_default_pose:
-            box.label(
-                text="Used for export blend phases and retarget start pose.",
-                icon="INFO",
-            )
-            row = box.row(align=True)
-            row.prop(
-                settings,
-                "default_pose_root_rotation",
-                index=0,
-                text="Default Root Roll",
-            )
-            row.prop(
-                settings,
-                "default_pose_root_rotation",
-                index=1,
-                text="Default Root Pitch",
-            )
-            row = box.row(align=True)
-            row.operator(
-                "object.capture_default_pose_from_current",
-                text="Capture Current Pose",
-                icon="IMPORT",
-            )
-            row.operator(
-                "object.sync_default_pose_joints",
-                text="Sync Joint List",
-                icon="FILE_REFRESH",
-            )
-            row.operator(
-                "object.reset_default_pose",
-                text="Reset Default Pose",
-                icon="LOOP_BACK",
-            )
-            box.template_list(
-                "UL_DefaultPoseJointList",
-                "",
-                settings,
-                "default_pose_joints",
-                settings,
-                "default_pose_active_index",
-                rows=5,
-            )
+        box.label(
+            text="Used for export blend phases and as the retarget base pose.",
+            icon="INFO",
+        )
+        row = box.row(align=True)
+        row.prop(
+            settings,
+            "default_pose_root_rotation",
+            index=0,
+            text="Neutral Root Roll",
+        )
+        row.prop(
+            settings,
+            "default_pose_root_rotation",
+            index=1,
+            text="Neutral Root Pitch",
+        )
+        row = box.row(align=True)
+        row.operator(
+            "object.capture_default_pose_from_current",
+            text="Capture Current Pose",
+            icon="IMPORT",
+        )
+        row.operator(
+            "object.sync_default_pose_joints",
+            text="Sync Joint List",
+            icon="FILE_REFRESH",
+        )
+        row.operator(
+            "object.reset_default_pose",
+            text="Reset Neutral Pose",
+            icon="LOOP_BACK",
+        )
+        box.template_list(
+            "UL_DefaultPoseJointList",
+            "",
+            settings,
+            "default_pose_joints",
+            settings,
+            "default_pose_active_index",
+            rows=5,
+        )
 
 
 class PANEL_ApplyAndExport(Panel):

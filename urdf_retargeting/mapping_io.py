@@ -168,6 +168,13 @@ def import_mapping_from_json(filepath, settings):
             # Keep import robust against version mismatches.
             continue
 
+    # Neutral pose is always active now; keep the stored flag only for
+    # backward-compatible preset roundtripping.
+    settings.use_custom_default_pose = True
+    if hasattr(settings, "default_pose_root_rotation"):
+        r = settings.default_pose_root_rotation
+        settings.default_pose_root_rotation = (r[0], r[1], 0.0)
+
     settings.mappings.clear()
     for m in data.get("mappings", []):
         item = settings.mappings.add()

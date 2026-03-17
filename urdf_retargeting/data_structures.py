@@ -549,13 +549,13 @@ class BVHMappingSettings(PropertyGroup):
     )
     export_blend_in_seconds: FloatProperty(
         name="Blend In (s)",
-        description="Duration in seconds to blend from default pose into the exported motion",
+        description="Duration in seconds to blend from neutral pose into the exported motion",
         default=0.0,
         min=0.0,
     )
     export_blend_out_seconds: FloatProperty(
         name="Blend Out (s)",
-        description="Duration in seconds to blend from exported motion back to default pose",
+        description="Duration in seconds to blend from exported motion back to neutral pose",
         default=0.0,
         min=0.0,
     )
@@ -566,24 +566,25 @@ class BVHMappingSettings(PropertyGroup):
         min=0.0,
     )
     use_custom_default_pose: BoolProperty(
-        name="Use Custom Default Pose",
-        description="Use custom default pose settings for export blend phases and as the initial URDF pose before retarget calibration",
-        default=False,
+        name="Use Neutral Pose",
+        description="Legacy compatibility flag for the stored neutral pose settings",
+        default=True,
+        options={"HIDDEN"},
     )
     default_pose_root_rotation: FloatVectorProperty(
-        name="Default Root Rotation",
-        description="Custom default root rotation (Euler XYZ)",
+        name="Neutral Root Rotation",
+        description="Stored neutral root rotation (Euler XYZ)",
         subtype="EULER",
         size=3,
         default=(0.0, 0.0, 0.0),
     )
     default_pose_joints: CollectionProperty(
         type=DefaultPoseJoint,
-        description="Editable default joint angles used for export blend phases and initial retarget pose",
+        description="Editable neutral joint angles used for export blend phases and initial retarget pose",
     )
     default_pose_active_index: IntProperty(
-        name="Default Pose Joint Index",
-        description="Active default-pose joint index in UI",
+        name="Neutral Pose Joint Index",
+        description="Active neutral-pose joint index in UI",
         default=0,
         min=0,
     )

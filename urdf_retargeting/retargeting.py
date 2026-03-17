@@ -202,25 +202,34 @@ def _short_cache_id(*parts: str) -> str:
     return hashlib.blake2b(payload, digest_size=8).hexdigest()
 
 
+def _get_custom_default_joint_angles(settings) -> dict[str, float]:
+    """Return stored custom default joint angles keyed by URDF joint name."""
+    return {
+        item.joint_name: item.angle
+        for item in getattr(settings, "default_pose_joints", [])
+    }
+
+
+def _get_custom_default_root_quaternion(settings) -> mathutils.Quaternion:
+    """Return the stored custom default root rotation or identity."""
+    root_rotation = getattr(settings, "default_pose_root_rotation", (0.0, 0.0, 0.0))
+    # UI intentionally exposes only roll/pitch for neutral pose root rotation.
+    # Force yaw to zero so legacy preset values cannot introduce hidden heading.
+    root_euler = mathutils.Euler((root_rotation[0], root_rotation[1], 0.0), "XYZ")
+    return root_euler.to_quaternion()
+
+
 def _compute_custom_default_end_local(
     urdf_obj: bpy.types.Object,
     settings,
     end_bone_name: str,
 ) -> mathutils.Vector | None:
     """Evaluate end-effector local position in custom default pose."""
-    if not settings.use_custom_default_pose:
-        return None
-
     end_bone = urdf_obj.pose.bones.get(end_bone_name)
     if not end_bone:
         return None
 
-    joint_defaults = {
-        item.joint_name: item.angle
-        for item in getattr(settings, "default_pose_joints", [])
-    }
-    if not joint_defaults:
-        return None
+    joint_defaults = _get_custom_default_joint_angles(settings)
 
     prev_root_q = urdf_obj.rotation_quaternion.copy()
     prev_bone_q = {}
@@ -230,8 +239,7 @@ def _compute_custom_default_end_local(
 
     try:
         urdf_obj.rotation_mode = "QUATERNION"
-        root_euler = mathutils.Euler(settings.default_pose_root_rotation, "XYZ")
-        urdf_obj.rotation_quaternion = root_euler.to_quaternion()
+        urdf_obj.rotation_quaternion = _get_custom_default_root_quaternion(settings)
 
         for joint_name, angle in joint_defaults.items():
             pb = urdf_obj.pose.bones.get(joint_name)
@@ -265,19 +273,10 @@ def apply_custom_default_pose_to_urdf(
     settings,
 ) -> bool:
     """Apply stored custom default pose values to the current URDF rig."""
-    if not settings.use_custom_default_pose:
-        return False
-
-    joint_defaults = {
-        item.joint_name: item.angle
-        for item in getattr(settings, "default_pose_joints", [])
-    }
-    if not joint_defaults:
-        return False
+    joint_defaults = _get_custom_default_joint_angles(settings)
 
     urdf_obj.rotation_mode = "QUATERNION"
-    root_euler = mathutils.Euler(settings.default_pose_root_rotation, "XYZ")
-    urdf_obj.rotation_quaternion = root_euler.to_quaternion()
+    urdf_obj.rotation_quaternion = _get_custom_default_root_quaternion(settings)
 
     for joint_name, target_angle in joint_defaults.items():
         pb = urdf_obj.pose.bones.get(joint_name)
@@ -761,6 +760,8 @@ def apply_joint_retargeting(
     if not bvh_b:
         return
 
+    default_joint_angles = _get_custom_default_joint_angles(settings)
+
     # Calculate the delta rotation relative to the reference (T-Pose)
     ref_q = mathutils.Quaternion(mapping_item.ref_rot)
     current_q = bvh_b.matrix_basis.to_quaternion()
@@ -813,9 +814,13 @@ def apply_joint_retargeting(
         if "offset" not in urdf_b:
             set_bone_property(urdf_b, "offset", val)
 
-        # Combine with calibration offset
+        default_pose_offset = default_joint_angles.get(urdf_b.name, 0.0)
+
+        # Combine retarget delta with calibration offset, optional custom
+        # default-pose base angle, and the user-authored neutral offset.
         target_angle = (
-            val
+            default_pose_offset
+            + val
             - get_bone_property(urdf_b, "offset", 0.0)
             + urdf_bone_mapping.neutral_offset
         )
@@ -859,23 +864,27 @@ def apply_foot_alignment(
     if flatten_str <= 0.0:
         return
 
-    # Build BVH-to-URDF foot bone mapping
+    # Build BVH-to-URDF foot bone mapping. A foot joint may appear both as a
+    # direct FK mapping and as an IK end-effector; apply alignment only once.
     bvh_to_urdf_map = {}
     for item in settings.mappings:
         if item.bvh_bone_name in [settings.foot_l_name, settings.foot_r_name]:
-            urdf_data = [
-                (b.urdf_bone_name, b.invert_alignment) for b in item.urdf_bones
-            ]
-            bvh_to_urdf_map[item.bvh_bone_name] = urdf_data
+            foot_targets = bvh_to_urdf_map.setdefault(item.bvh_bone_name, [])
+            seen_targets = {name for name, _ in foot_targets}
+            for b in item.urdf_bones:
+                if not b.urdf_bone_name or b.urdf_bone_name in seen_targets:
+                    continue
+                foot_targets.append((b.urdf_bone_name, b.invert_alignment))
+                seen_targets.add(b.urdf_bone_name)
 
     for chain in settings.kinematic_chains:
         if (
             chain.bvh_target_bone_name in [settings.foot_l_name, settings.foot_r_name]
             and chain.urdf_end_bone_name
         ):
-            bvh_to_urdf_map.setdefault(chain.bvh_target_bone_name, []).append(
-                (chain.urdf_end_bone_name, False)
-            )
+            foot_targets = bvh_to_urdf_map.setdefault(chain.bvh_target_bone_name, [])
+            if chain.urdf_end_bone_name not in {name for name, _ in foot_targets}:
+                foot_targets.append((chain.urdf_end_bone_name, False))
 
     for bvh_foot_name in [settings.foot_l_name, settings.foot_r_name]:
         if bvh_foot_name not in bvh_to_urdf_map:
@@ -1024,6 +1033,7 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     # ------------------------------------------------------------------
     ref_rot = mathutils.Quaternion(scene.get("ref_root_rot", (1, 0, 0, 0)))
     off_q = mathutils.Euler(settings.rotation_offset).to_quaternion()
+    default_root_q = _get_custom_default_root_quaternion(settings)
     current_bvh_rot = bvh_root_mat.to_quaternion()
 
     delta_rot = current_bvh_rot @ ref_rot.inverted()
@@ -1047,7 +1057,9 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     )
 
     urdf.rotation_mode = "QUATERNION"
-    urdf.rotation_quaternion = persistent_rot_correction @ off_q @ delta_rot
+    urdf.rotation_quaternion = (
+        persistent_rot_correction @ off_q @ default_root_q @ delta_rot
+    )
 
     # ------------------------------------------------------------------
     # 3.  Joint retargeting  (angle extraction or kinematic IK)
