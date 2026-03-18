@@ -196,6 +196,33 @@ def _smooth_target_position(
     return target_world
 
 
+def _compute_adaptive_step_limit(
+    base_limit: float,
+    residual_abs: float,
+    adaptive_gain: float,
+    min_scale: float = 0.35,
+    max_scale: float = 3.0,
+) -> float:
+    """
+    Compute a smooth residual-dependent step limit.
+
+    Compared to hard clamping with a fixed per-frame step, this produces
+    smaller steps near zero residual (less visible jitter) and larger steps
+    for large residuals (faster convergence without sudden mode switches).
+    """
+    base = max(0.0, float(base_limit))
+    if base <= 0.0:
+        return 0.0
+
+    residual = max(0.0, float(residual_abs))
+    gain = max(0.0, float(adaptive_gain))
+
+    norm = residual / max(base, 1e-9)
+    response = 1.0 - math.exp(-gain * norm)
+    scale = min_scale + (max_scale - min_scale) * response
+    return base * scale
+
+
 def _short_cache_id(*parts: str) -> str:
     """Return a short deterministic IDProperty-safe key suffix."""
     payload = "|".join(parts).encode("utf-8", errors="ignore")
@@ -657,15 +684,9 @@ def apply_kinematic_retargeting(
             bvh_floor_offset = scene.get("bvh_floor_offset", 0.0)
             foot_height = bvh_target_world.z - bvh_floor_offset
             if foot_height <= settings.jump_threshold:
-                # Determine foot velocity from inter-frame position cache.
-                foot_positions = scene.get("_foot_positions_prev", {})
-                prev_foot_pos = foot_positions.get(chain.bvh_target_bone_name)
-                if prev_foot_pos is not None:
-                    foot_vel = (
-                        bvh_target_world - mathutils.Vector(prev_foot_pos)
-                    ).length
-                else:
-                    foot_vel = 0.0
+                # Use per-frame velocity snapshot from stance detection.
+                foot_velocities = scene.get("_foot_velocities", {})
+                foot_vel = float(foot_velocities.get(chain.bvh_target_bone_name, 0.0))
 
                 # Scale ground-lock strength down when the foot is moving.
                 # A velocity > 0.02 m/frame (~1.2 m/s at 60 fps) is considered
@@ -1053,6 +1074,9 @@ def detect_stance_foot(
 
     both_grounded = len(active_contacts) >= 2
 
+    # Snapshot for consumers in the same frame (IK ground-lock, debug UI).
+    scene["_foot_velocities"] = {name: float(v) for name, v in foot_velocities.items()}
+
     return anchor_bone_name, is_switch, both_grounded
 
 
@@ -1312,6 +1336,13 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     if not bvh.pose.bones:
         return
 
+    debug_metrics_enabled = bool(getattr(settings, "stability_debug_metrics", False))
+    dbg_anchor_switches = 0
+    dbg_yaw_residual_abs = 0.0
+    dbg_yaw_step_abs = 0.0
+    dbg_xy_drift_abs = 0.0
+    dbg_xy_step_abs = 0.0
+
     # ------------------------------------------------------------------
     # Reset state at the first frame to avoid drift from previous plays
     # ------------------------------------------------------------------
@@ -1395,6 +1426,9 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     anchor_bone_name, is_anchor_switch, both_grounded = detect_stance_foot(
         scene, bvh, settings
     )
+    if is_anchor_switch:
+        dbg_anchor_switches = 1
+
     last_anchor = scene.get("_active_anchor_name", "")
     is_first_anchor = anchor_bone_name != "" and last_anchor == ""
 
@@ -1513,10 +1547,21 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
                         bvh_yaw_change = _wrap_angle(cur_bvh_yaw - anchor_bvh_yaw)
 
                 yaw_residual = _wrap_angle(urdf_yaw_change - bvh_yaw_change)
+                dbg_yaw_residual_abs = max(dbg_yaw_residual_abs, abs(yaw_residual))
 
                 if abs(yaw_residual) > 1e-6:
-                    max_yaw = max(1e-5, settings.foot_pin_yaw_max_step)
+                    base_yaw = max(1e-5, settings.foot_pin_yaw_max_step)
+                    if bool(getattr(settings, "adaptive_foot_pinning", True)):
+                        max_yaw = _compute_adaptive_step_limit(
+                            base_yaw,
+                            abs(yaw_residual),
+                            getattr(settings, "foot_pin_adaptive_gain", 1.5),
+                        )
+                    else:
+                        max_yaw = base_yaw
+
                     yaw_step = clamp_to_limits(-yaw_residual, -max_yaw, max_yaw)
+                    dbg_yaw_step_abs = max(dbg_yaw_step_abs, abs(yaw_step))
                     yaw_fix_q = mathutils.Quaternion((0, 0, 1), yaw_step)
 
                     urdf.rotation_quaternion = yaw_fix_q @ urdf.rotation_quaternion
@@ -1549,12 +1594,25 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
                 drift_x = foot_world.x - anchor_x
                 drift_y = foot_world.y - anchor_y
 
-                max_xy = max(1e-6, settings.foot_pin_xy_max_step)
                 drift_len = math.hypot(drift_x, drift_y)
+                dbg_xy_drift_abs = max(dbg_xy_drift_abs, drift_len)
+
+                base_xy = max(1e-6, settings.foot_pin_xy_max_step)
+                if bool(getattr(settings, "adaptive_foot_pinning", True)):
+                    max_xy = _compute_adaptive_step_limit(
+                        base_xy,
+                        drift_len,
+                        getattr(settings, "foot_pin_adaptive_gain", 1.5),
+                    )
+                else:
+                    max_xy = base_xy
+
                 if drift_len > max_xy:
                     scale = max_xy / drift_len
                     drift_x *= scale
                     drift_y *= scale
+
+                dbg_xy_step_abs = max(dbg_xy_step_abs, math.hypot(drift_x, drift_y))
 
                 urdf.location.x -= drift_x
                 urdf.location.y -= drift_y
@@ -1655,3 +1713,20 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
         scene["_retarget_ms_ema"] = elapsed_ms
     else:
         scene["_retarget_ms_ema"] = (0.9 * float(prev_ms)) + (0.1 * elapsed_ms)
+
+    if debug_metrics_enabled:
+        scene["_stability_dbg_anchor_switch"] = int(dbg_anchor_switches)
+        scene["_stability_dbg_yaw_residual"] = float(dbg_yaw_residual_abs)
+        scene["_stability_dbg_yaw_step"] = float(dbg_yaw_step_abs)
+        scene["_stability_dbg_xy_drift"] = float(dbg_xy_drift_abs)
+        scene["_stability_dbg_xy_step"] = float(dbg_xy_step_abs)
+    else:
+        for key in (
+            "_stability_dbg_anchor_switch",
+            "_stability_dbg_yaw_residual",
+            "_stability_dbg_yaw_step",
+            "_stability_dbg_xy_drift",
+            "_stability_dbg_xy_step",
+        ):
+            if key in scene:
+                del scene[key]

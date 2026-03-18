@@ -33,6 +33,8 @@ PRESET_SETTING_FIELDS = [
     "foot_flattening_strength",
     "foot_pin_xy_max_step",
     "foot_pin_yaw_max_step",
+    "adaptive_foot_pinning",
+    "foot_pin_adaptive_gain",
     "correction_decay",
     "correction_decay_airborne_only",
     "root_scale",
@@ -46,6 +48,7 @@ PRESET_SETTING_FIELDS = [
     "mapping_preset_name",
     "mapping_robot_profile",
     "mapping_mocap_profile",
+    "stability_debug_metrics",
 ]
 
 

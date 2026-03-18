@@ -323,6 +323,11 @@ class BVHMappingSettings(PropertyGroup):
         description="Abort bake when a single frame exceeds the watchdog frame limit",
         default=False,
     )
+    stability_debug_metrics: BoolProperty(
+        name="Debug Stability Metrics",
+        description="Collect and expose per-frame jitter diagnostics in scene properties",
+        default=False,
+    )
     ik_tolerance: FloatProperty(
         name="IK Tolerance",
         description="Stop the IK solve when the end-effector is closer than this distance to the target",
@@ -469,6 +474,21 @@ class BVHMappingSettings(PropertyGroup):
         min=0.005,
         max=1.0,
         subtype="ANGLE",
+    )
+    adaptive_foot_pinning: BoolProperty(
+        name="Adaptive Foot Pinning",
+        description=(
+            "Use smooth residual-dependent XY/yaw correction limits "
+            "instead of fixed hard per-frame caps"
+        ),
+        default=True,
+    )
+    foot_pin_adaptive_gain: FloatProperty(
+        name="Pin Adaptive Gain",
+        description="Response gain for adaptive foot-pinning step limits",
+        default=1.5,
+        min=0.1,
+        max=6.0,
     )
 
     # Foot Flattening

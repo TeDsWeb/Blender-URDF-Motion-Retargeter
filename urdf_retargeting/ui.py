@@ -176,6 +176,7 @@ class PANEL_MotionOptions(Panel):
             if settings.hybrid_realtime_guard:
                 perf_box.prop(settings, "hybrid_min_iterations")
             perf_box.prop(settings, "quality_ik_iterations")
+            perf_box.prop(settings, "stability_debug_metrics")
             perf_box.separator()
             perf_box.prop(settings, "bake_watchdog_enabled")
             if settings.bake_watchdog_enabled:
@@ -205,6 +206,24 @@ class PANEL_MotionOptions(Panel):
         sink_ms = context.scene.get("_retarget_ms_sink", None)
         if sink_ms is not None:
             perf_box.label(text=f"Anti-Sink: {sink_ms:.2f} ms", icon="EMPTY_ARROWS")
+
+        if settings.stability_debug_metrics:
+            perf_box.separator()
+            yaw_res = context.scene.get("_stability_dbg_yaw_residual", None)
+            if yaw_res is not None:
+                perf_box.label(text=f"Dbg Yaw Residual: {yaw_res:.4f} rad")
+            yaw_step = context.scene.get("_stability_dbg_yaw_step", None)
+            if yaw_step is not None:
+                perf_box.label(text=f"Dbg Yaw Step: {yaw_step:.4f} rad")
+            xy_drift = context.scene.get("_stability_dbg_xy_drift", None)
+            if xy_drift is not None:
+                perf_box.label(text=f"Dbg XY Drift: {xy_drift:.4f} m")
+            xy_step = context.scene.get("_stability_dbg_xy_step", None)
+            if xy_step is not None:
+                perf_box.label(text=f"Dbg XY Step: {xy_step:.4f} m")
+            anchor_switch = context.scene.get("_stability_dbg_anchor_switch", None)
+            if anchor_switch is not None:
+                perf_box.label(text=f"Dbg Anchor Switch: {int(anchor_switch)}")
 
 
 class PANEL_FootConfiguration(Panel):
@@ -244,6 +263,9 @@ class PANEL_FootConfiguration(Panel):
             box.prop(settings, "foot_flattening_height", slider=True)
             box.prop(settings, "foot_pin_xy_max_step", slider=True)
             box.prop(settings, "foot_pin_yaw_max_step", slider=True)
+            box.prop(settings, "adaptive_foot_pinning")
+            if settings.adaptive_foot_pinning:
+                box.prop(settings, "foot_pin_adaptive_gain", slider=True)
             box.prop(settings, "correction_decay", slider=True)
             box.prop(settings, "correction_decay_airborne_only")
 
