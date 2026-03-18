@@ -50,8 +50,6 @@ class OT_CaptureDefaultPoseFromCurrent(Operator):
 
         joint_names = list(urdf.get("urdf_joint_order", []))
 
-        settings.use_custom_default_pose = True
-
         q = urdf.rotation_quaternion
         e = q.to_euler("XYZ")
         # Keep only roll/pitch editable by user; yaw is taken from motion during export.
@@ -87,7 +85,6 @@ class OT_ResetDefaultPose(Operator):
 
     def execute(self, context):
         settings = context.scene.bvh_mapping_settings
-        settings.use_custom_default_pose = True
         settings.default_pose_root_rotation = (0.0, 0.0, 0.0)
         settings.default_pose_joints.clear()
         settings.default_pose_active_index = 0
@@ -113,7 +110,6 @@ class OT_SyncDefaultPoseJoints(Operator):
 
         joint_names = list(urdf.get("urdf_joint_order", []))
         _sync_default_pose_joints(settings, joint_names)
-        settings.use_custom_default_pose = True
 
         self.report(
             {"INFO"},
@@ -581,7 +577,7 @@ class OT_ExportBeyondMimic(Operator):
                             "blend_in_seconds": self._blend_in_seconds,
                             "blend_out_seconds": self._blend_out_seconds,
                             "end_pose_hold_seconds": self._end_pose_hold_seconds,
-                            "use_custom_default_pose": settings.use_custom_default_pose,
+                            "use_custom_default_pose": True,
                             "root_position_mode": "match_motion_start_end",
                             "root_yaw_mode": "match_motion_start_end",
                             "root_rotation_user_editable": ["roll", "pitch"],
@@ -594,12 +590,11 @@ class OT_ExportBeyondMimic(Operator):
                         "joint_smoothing": settings.joint_smoothing,
                         "retarget_quality": {
                             "mode": "full_quality",
+                            "ik_solver": "fabrik_c",
                             "hybrid_ik_blend": settings.hybrid_ik_blend,
                             "realtime_guard_ui_enabled": settings.hybrid_realtime_guard,
-                            "frame_skip_ui_value": settings.hybrid_ik_frame_skip,
                             "realtime_guard_applied_during_export": False,
-                            "frame_skip_applied_during_export": False,
-                            "note": "Export forces full IK quality; realtime guard and frame skip are ignored during frame evaluation.",
+                            "note": "Export forces full IK quality; realtime guard throttling is ignored during frame evaluation.",
                         },
                         # Units
                         "measurement_unit": "meters",

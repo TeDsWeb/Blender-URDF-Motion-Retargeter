@@ -120,9 +120,6 @@ class PANEL_MotionOptions(Panel):
         layout = self.layout
         settings = context.scene.bvh_mapping_settings
 
-        # Keep old scene files compatible but expose one production path in UI.
-        if settings.retargeting_method != "HYBRID":
-            settings.retargeting_method = "HYBRID"
         layout.label(text="Retargeting: Hybrid FK + IK", icon="INFO")
 
         # Root motion control
@@ -141,6 +138,7 @@ class PANEL_MotionOptions(Panel):
         # --- HYBRID: FK Baseline ---
         fk_box = layout.box()
         fk_box.label(text="FK Baseline", icon="BONE_DATA")
+        fk_box.prop(settings, "ik_only_mode")
         fk_box.prop(settings, "joint_smoothing", slider=True)
         if _draw_advanced_toggle(fk_box, settings, "ui_show_fk_advanced"):
             fk_box.prop(settings, "max_jump_threshold", slider=True)
@@ -148,9 +146,9 @@ class PANEL_MotionOptions(Panel):
         # --- HYBRID: IK Correction ---
         ik_box = layout.box()
         ik_box.label(text="IK Correction", icon="CON_KINEMATIC")
+        ik_box.label(text="Solver: FABRIK-C", icon="INFO")
         ik_box.prop(settings, "hybrid_ik_blend", slider=True)
         ik_box.prop(settings, "ik_target_smoothing", slider=True)
-        ik_box.prop(settings, "ik_joint_smoothing", slider=True)
         if _draw_advanced_toggle(ik_box, settings, "ui_show_ik_advanced"):
             ik_box.prop(settings, "hybrid_adaptive_ik")
             if settings.hybrid_adaptive_ik:
@@ -158,9 +156,7 @@ class PANEL_MotionOptions(Panel):
                 sub.prop(settings, "hybrid_min_ik_blend", slider=True)
                 sub.prop(settings, "hybrid_error_low")
                 sub.prop(settings, "hybrid_error_high")
-                sub.prop(settings, "hybrid_blend_smoothing", slider=True)
             ik_box.separator()
-            ik_box.prop(settings, "ik_micro_deadzone", slider=True)
             ik_box.prop(settings, "ik_iterations")
             ik_box.prop(settings, "ik_tolerance")
             ik_box.prop(settings, "ik_max_step_angle", slider=True)
@@ -179,7 +175,6 @@ class PANEL_MotionOptions(Panel):
         ):
             if settings.hybrid_realtime_guard:
                 perf_box.prop(settings, "hybrid_min_iterations")
-            perf_box.prop(settings, "hybrid_ik_frame_skip")
             perf_box.prop(settings, "quality_ik_iterations")
             perf_box.separator()
             perf_box.prop(settings, "bake_watchdog_enabled")
@@ -195,6 +190,15 @@ class PANEL_MotionOptions(Panel):
         ik_ms = context.scene.get("_retarget_ms_ik", None)
         if ik_ms is not None:
             perf_box.label(text=f"IK Stage: {ik_ms:.2f} ms", icon="CON_KINEMATIC")
+        fabrik_iters = context.scene.get("_ik_fabrik_avg_iters", None)
+        if fabrik_iters is not None:
+            perf_box.label(text=f"FABRIK Avg Iter: {fabrik_iters:.2f}", icon="DRIVER")
+        fabrik_residual = context.scene.get("_ik_fabrik_avg_residual", None)
+        if fabrik_residual is not None:
+            perf_box.label(
+                text=f"FABRIK Residual: {fabrik_residual:.4f} m",
+                icon="TRACKING_REFINE_FORWARDS",
+            )
         fk_ms = context.scene.get("_retarget_ms_fk", None)
         if fk_ms is not None:
             perf_box.label(text=f"FK Stage: {fk_ms:.2f} ms", icon="BONE_DATA")
@@ -241,6 +245,7 @@ class PANEL_FootConfiguration(Panel):
             box.prop(settings, "foot_pin_xy_max_step", slider=True)
             box.prop(settings, "foot_pin_yaw_max_step", slider=True)
             box.prop(settings, "correction_decay", slider=True)
+            box.prop(settings, "correction_decay_airborne_only")
 
 
 class PANEL_BoneMapping(Panel):

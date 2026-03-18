@@ -214,7 +214,7 @@ def _get_custom_default_root_quaternion(settings) -> mathutils.Quaternion:
     """Return the stored custom default root rotation or identity."""
     root_rotation = getattr(settings, "default_pose_root_rotation", (0.0, 0.0, 0.0))
     # UI intentionally exposes only roll/pitch for neutral pose root rotation.
-    # Force yaw to zero so legacy preset values cannot introduce hidden heading.
+    # Force yaw to zero so stored settings cannot introduce hidden heading.
     root_euler = mathutils.Euler((root_rotation[0], root_rotation[1], 0.0), "XYZ")
     return root_euler.to_quaternion()
 
@@ -268,6 +268,262 @@ def _compute_custom_default_end_local(
         bpy.context.view_layer.update()
 
 
+def _compute_custom_default_chain_reference(
+    urdf_obj: bpy.types.Object,
+    settings,
+    solver_bones: list[bpy.types.PoseBone],
+    end_bone: bpy.types.PoseBone,
+) -> dict | None:
+    """
+    Capture chain-local neutral pose reference for FABRIK-C.
+
+    Returns local-space points, segment lengths, hinge axes and base segment
+    directions (all in armature-object space) so runtime solving can avoid
+    repeated scene updates and pose baking.
+    """
+    if not solver_bones:
+        return None
+
+    joint_defaults = _get_custom_default_joint_angles(settings)
+
+    prev_root_q = urdf_obj.rotation_quaternion.copy()
+    prev_bone_q = {}
+    for pb in urdf_obj.pose.bones:
+        prev_bone_q[pb.name] = pb.rotation_quaternion.copy()
+
+    try:
+        urdf_obj.rotation_mode = "QUATERNION"
+        urdf_obj.rotation_quaternion = _get_custom_default_root_quaternion(settings)
+
+        for joint_name, angle in joint_defaults.items():
+            pb = urdf_obj.pose.bones.get(joint_name)
+            if not pb:
+                continue
+
+            jtype = get_bone_property(pb, "joint_type", "revolute")
+            if jtype not in {"revolute", "continuous"}:
+                continue
+
+            if jtype != "continuous":
+                l_min = get_bone_property(pb, "limit_lower", -3.14)
+                l_max = get_bone_property(pb, "limit_upper", 3.14)
+                angle = clamp_to_limits(angle, l_min, l_max)
+
+            pb.rotation_mode = "QUATERNION"
+            pb.rotation_quaternion = mathutils.Quaternion((0, 1, 0), angle)
+
+        bpy.context.view_layer.update()
+
+        points_local = [pb.matrix.to_translation().copy() for pb in solver_bones]
+        points_local.append(end_bone.matrix.to_translation().copy())
+
+        hinge_axes_local = []
+        for pb in solver_bones:
+            axis = pb.matrix.to_quaternion() @ mathutils.Vector((0, 1, 0))
+            if axis.length_squared < 1e-12:
+                axis = mathutils.Vector((0, 1, 0))
+            else:
+                axis = axis.normalized()
+            hinge_axes_local.append(axis)
+
+        segment_lengths = []
+        base_dirs_local = []
+        for i in range(len(points_local) - 1):
+            seg = points_local[i + 1] - points_local[i]
+            seg_len = max(1e-9, seg.length)
+            segment_lengths.append(seg_len)
+            if seg.length_squared < 1e-12:
+                base_dirs_local.append(mathutils.Vector((1, 0, 0)))
+            else:
+                base_dirs_local.append(seg.normalized())
+
+        return {
+            "points_local": [tuple(v) for v in points_local],
+            "hinge_axes_local": [tuple(v) for v in hinge_axes_local],
+            "base_dirs_local": [tuple(v) for v in base_dirs_local],
+            "segment_lengths": segment_lengths,
+        }
+    finally:
+        urdf_obj.rotation_quaternion = prev_root_q
+        for pb in urdf_obj.pose.bones:
+            if pb.name in prev_bone_q:
+                pb.rotation_quaternion = prev_bone_q[pb.name]
+        bpy.context.view_layer.update()
+
+
+def _apply_hinge_direction_constraint(
+    raw_dir: mathutils.Vector,
+    axis_world: mathutils.Vector,
+    base_dir_world: mathutils.Vector,
+) -> mathutils.Vector:
+    """
+    Constrain a segment direction to a revolute (hinge) manifold.
+
+    The constrained direction preserves the base direction's component
+    along the hinge axis and rotates only inside the perpendicular plane.
+    """
+    if raw_dir.length_squared < 1e-12:
+        return base_dir_world.normalized()
+
+    axis = (
+        axis_world.normalized()
+        if axis_world.length_squared > 1e-12
+        else mathutils.Vector((0, 1, 0))
+    )
+    base = (
+        base_dir_world.normalized()
+        if base_dir_world.length_squared > 1e-12
+        else mathutils.Vector((1, 0, 0))
+    )
+    raw = raw_dir.normalized()
+
+    base_axis_component = clamp_to_limits(base.dot(axis), -1.0, 1.0)
+    base_perp_len = math.sqrt(max(0.0, 1.0 - base_axis_component * base_axis_component))
+
+    raw_perp = raw - axis * raw.dot(axis)
+    if raw_perp.length_squared < 1e-12:
+        base_perp = base - axis * base_axis_component
+        if base_perp.length_squared < 1e-12:
+            perp_axis = axis.cross(mathutils.Vector((1, 0, 0)))
+            if perp_axis.length_squared < 1e-12:
+                perp_axis = axis.cross(mathutils.Vector((0, 0, 1)))
+            raw_perp_dir = perp_axis.normalized()
+        else:
+            raw_perp_dir = base_perp.normalized()
+    else:
+        raw_perp_dir = raw_perp.normalized()
+
+    constrained = (axis * base_axis_component) + (raw_perp_dir * base_perp_len)
+    if constrained.length_squared < 1e-12:
+        return base
+    return constrained.normalized()
+
+
+def _solve_fabrik_c_positions(
+    initial_points: list[mathutils.Vector],
+    target_world: mathutils.Vector,
+    segment_lengths: list[float],
+    max_iterations: int,
+    tolerance: float,
+    hinge_axes_world: list[mathutils.Vector] | None = None,
+    hinge_base_dirs_world: list[mathutils.Vector] | None = None,
+    target_orientation: mathutils.Quaternion | None = None,
+    orientation_weight: float = 0.0,
+) -> tuple[list[mathutils.Vector], int, float]:
+    """
+    Solve chain positions with FABRIK-C (position solve + hinge constraints).
+
+    This function runs purely in math space. No Blender dependency-graph
+    updates are performed inside the iteration loop.
+    """
+    if len(initial_points) < 2 or len(segment_lengths) != len(initial_points) - 1:
+        points = [p.copy() for p in initial_points]
+        residual = (points[-1] - target_world).length if points else 0.0
+        return points, 0, residual
+
+    points = [p.copy() for p in initial_points]
+    n_seg = len(segment_lengths)
+    root = points[0].copy()
+    total_reach = sum(segment_lengths)
+
+    to_target = target_world - root
+    if to_target.length > total_reach and total_reach > 1e-9:
+        direction = to_target.normalized()
+        for i in range(n_seg):
+            if hinge_axes_world is not None and hinge_base_dirs_world is not None:
+                direction = _apply_hinge_direction_constraint(
+                    direction,
+                    hinge_axes_world[i],
+                    hinge_base_dirs_world[i],
+                )
+            points[i + 1] = points[i] + direction * segment_lengths[i]
+        residual = (points[-1] - target_world).length
+        return points, 1, residual
+
+    tol = max(1e-6, tolerance)
+    iterations_used = 0
+    for iter_idx in range(max(1, max_iterations)):
+        iterations_used = iter_idx + 1
+        points[-1] = target_world.copy()
+
+        if target_orientation is not None and orientation_weight > 1e-6 and n_seg >= 1:
+            desired_dir = target_orientation @ mathutils.Vector((1, 0, 0))
+            if desired_dir.length_squared > 1e-12:
+                desired_dir.normalize()
+                cur_dir = points[-1] - points[-2]
+                if cur_dir.length_squared > 1e-12:
+                    cur_dir.normalize()
+                else:
+                    cur_dir = desired_dir.copy()
+                w = clamp_to_limits(orientation_weight, 0.0, 1.0)
+                blend_dir = cur_dir.lerp(desired_dir, w)
+                if blend_dir.length_squared > 1e-12:
+                    blend_dir.normalize()
+                    points[-2] = points[-1] - blend_dir * segment_lengths[-1]
+
+        for i in range(n_seg - 1, -1, -1):
+            dist = (points[i + 1] - points[i]).length
+            if dist < 1e-12:
+                continue
+            lam = segment_lengths[i] / dist
+            proposed_joint = ((1.0 - lam) * points[i + 1]) + (lam * points[i])
+
+            raw_dir = points[i + 1] - proposed_joint
+            if hinge_axes_world is not None and hinge_base_dirs_world is not None:
+                dir_constrained = _apply_hinge_direction_constraint(
+                    raw_dir,
+                    hinge_axes_world[i],
+                    hinge_base_dirs_world[i],
+                )
+            elif raw_dir.length_squared > 1e-12:
+                dir_constrained = raw_dir.normalized()
+            else:
+                dir_constrained = mathutils.Vector((1, 0, 0))
+
+            points[i] = points[i + 1] - dir_constrained * segment_lengths[i]
+
+        points[0] = root.copy()
+
+        for i in range(n_seg):
+            dist = (points[i + 1] - points[i]).length
+            if dist < 1e-12:
+                raw_dir = mathutils.Vector((1, 0, 0))
+            else:
+                lam = segment_lengths[i] / dist
+                proposed_child = ((1.0 - lam) * points[i]) + (lam * points[i + 1])
+                raw_dir = proposed_child - points[i]
+
+            if hinge_axes_world is not None and hinge_base_dirs_world is not None:
+                dir_constrained = _apply_hinge_direction_constraint(
+                    raw_dir,
+                    hinge_axes_world[i],
+                    hinge_base_dirs_world[i],
+                )
+            elif raw_dir.length_squared > 1e-12:
+                dir_constrained = raw_dir.normalized()
+            else:
+                dir_constrained = mathutils.Vector((1, 0, 0))
+
+            points[i + 1] = points[i] + dir_constrained * segment_lengths[i]
+
+        if (points[-1] - target_world).length <= tol:
+            break
+
+    residual = (points[-1] - target_world).length
+    return points, iterations_used, residual
+
+
+def _collect_chain_points_world(
+    urdf_obj: bpy.types.Object,
+    solver_bones: list[bpy.types.PoseBone],
+    end_bone: bpy.types.PoseBone,
+) -> list[mathutils.Vector]:
+    """Collect world-space points for all solver joints plus end-effector."""
+    points = [_get_pose_bone_world_position(urdf_obj, pb) for pb in solver_bones]
+    points.append(_get_pose_bone_world_position(urdf_obj, end_bone))
+    return points
+
+
 def apply_custom_default_pose_to_urdf(
     urdf_obj: bpy.types.Object,
     settings,
@@ -304,10 +560,18 @@ def apply_kinematic_retargeting(
     correction_blend: float = 1.0,
     max_iterations_override: int | None = None,
 ) -> None:
-    """Retarget URDF joint chains by solving BVH end-effector targets with CCD IK."""
+    """Retarget URDF joint chains by solving BVH end-effector targets with FABRIK-C."""
     if "_kinematic_target_cache" not in scene:
         scene["_kinematic_target_cache"] = {}
     target_cache = scene["_kinematic_target_cache"]
+
+    solver_pin_anchor = str(scene.get("_ik_solver_pin_anchor", ""))
+    solver_pin_pos = scene.get("_ik_solver_pin_pos", None)
+    solver_pin_enabled = bool(solver_pin_anchor and solver_pin_pos is not None)
+
+    total_iters = 0.0
+    total_residual = 0.0
+    solved_chains = 0
 
     bvh_root_mat = bvh_obj.matrix_world @ bvh_obj.pose.bones[0].matrix
 
@@ -384,15 +648,36 @@ def apply_kinematic_retargeting(
             settings.ik_proportion_blend,
         )
 
-        # Keep planted feet close to custom/default URDF reference height.
+        # Keep planted feet close to custom/default URDF reference height,
+        # but only when the foot is truly stationary (low velocity).
+        # During swing phases the foot moves quickly even though it may be
+        # close to the ground; locking Z at those moments suppresses the
+        # backward swing and causes the asymmetric one-sided motion.
         if chain.bvh_target_bone_name in {settings.foot_l_name, settings.foot_r_name}:
             bvh_floor_offset = scene.get("bvh_floor_offset", 0.0)
             foot_height = bvh_target_world.z - bvh_floor_offset
             if foot_height <= settings.jump_threshold:
-                lock = settings.ik_ground_lock_strength
-                desired_local.z = (
-                    1.0 - lock
-                ) * desired_local.z + lock * ref_urdf_local.z
+                # Determine foot velocity from inter-frame position cache.
+                foot_positions = scene.get("_foot_positions_prev", {})
+                prev_foot_pos = foot_positions.get(chain.bvh_target_bone_name)
+                if prev_foot_pos is not None:
+                    foot_vel = (
+                        bvh_target_world - mathutils.Vector(prev_foot_pos)
+                    ).length
+                else:
+                    foot_vel = 0.0
+
+                # Scale ground-lock strength down when the foot is moving.
+                # A velocity > 0.02 m/frame (~1.2 m/s at 60 fps) is considered
+                # swing phase — full velocity release.
+                vel_scale = max(
+                    0.0, 1.0 - foot_vel / max(1e-6, settings.jump_threshold * 2.0)
+                )
+                effective_lock = settings.ik_ground_lock_strength * vel_scale
+                if effective_lock > 1e-4:
+                    desired_local.z = (
+                        1.0 - effective_lock
+                    ) * desired_local.z + effective_lock * ref_urdf_local.z
 
         target_world = urdf_obj.matrix_world @ desired_local
 
@@ -424,7 +709,48 @@ def apply_kinematic_retargeting(
             initial_value=end_world_now,
         )
 
+        # Deep foot-pinning integration: keep the active stance-foot target
+        # fixed inside the IK solver instead of relying purely on post-correction.
+        if (
+            solver_pin_enabled
+            and chain.bvh_target_bone_name == solver_pin_anchor
+            and chain.bvh_target_bone_name
+            in {settings.foot_l_name, settings.foot_r_name}
+        ):
+            target_world = mathutils.Vector(solver_pin_pos)
+
         pre_error = (target_world - end_world_now).length
+
+        is_foot_chain = chain.bvh_target_bone_name in {
+            settings.foot_l_name,
+            settings.foot_r_name,
+        }
+        desired_end_world_q = None
+        orient_weight = 0.0
+        if is_foot_chain:
+            # Track end-effector orientation in IK for feet so direction matching
+            # happens in the solver instead of a strong post-process correction.
+            bvh_target_world_q = (
+                bvh_obj.matrix_world @ bvh_target_bone.matrix
+            ).to_quaternion()
+            ref_orient_key = f"ik_r_q_{chain_key}"
+            if ref_orient_key not in target_cache:
+                end_world_q = (urdf_obj.matrix_world @ end_bone.matrix).to_quaternion()
+                ref_orient_q = end_world_q @ bvh_target_world_q.inverted()
+                target_cache[ref_orient_key] = (
+                    ref_orient_q.w,
+                    ref_orient_q.x,
+                    ref_orient_q.y,
+                    ref_orient_q.z,
+                )
+
+            ref_orient_q = mathutils.Quaternion(target_cache[ref_orient_key])
+            desired_end_world_q = ref_orient_q @ bvh_target_world_q
+            orient_weight = clamp_to_limits(
+                getattr(settings, "ik_foot_orientation_weight", 0.35),
+                0.0,
+                1.0,
+            )
 
         # Hybrid mode can adapt IK strength by current target error:
         # keep FK-dominant behavior for tiny residuals and progressively
@@ -448,38 +774,11 @@ def apply_kinematic_retargeting(
             adaptive_gain = min_blend + (1.0 - min_blend) * t
             chain_blend *= adaptive_gain
 
-        # Smooth chain blend over time to avoid frame-to-frame jitter.
-        blend_key = f"ik_blend_{chain_key}"
-        prev_blend = target_cache.get(blend_key, chain_blend)
-        smooth = clamp_to_limits(
-            getattr(settings, "hybrid_blend_smoothing", 0.8),
-            0.0,
-            0.98,
-        )
-        chain_blend = (smooth * float(prev_blend)) + (
-            (1.0 - smooth) * float(chain_blend)
-        )
-        target_cache[blend_key] = chain_blend
+        # FABRIK-C path uses direct adaptive blend without extra temporal EMA.
+        chain_blend = clamp_to_limits(chain_blend, 0.0, 1.0)
 
         for pose_bone in solver_bones:
             pose_bone.rotation_mode = "QUATERNION"
-
-        # Capture the per-bone angle from the *previous frame* before the solver
-        # changes anything.  Used by the post-solver EMA pass so that cross-frame
-        # temporal smoothing is cleanly separated from intra-frame CCD convergence.
-        # Mixing these two concerns inside the iteration loop caused the solver to
-        # fight its own inertia on every step, leaving a residual error that
-        # oscillated frame-to-frame (the source of the observed jitter).
-        joint_smooth = max(0.0, getattr(settings, "ik_joint_smoothing", 0.0))
-        if joint_smooth > 0.0:
-            prev_frame_angles = {
-                pb.name: get_bone_property(
-                    pb,
-                    "_ik_last_angle",
-                    get_bone_property(pb, "_joint_angle", 0.0),
-                )
-                for pb in solver_bones
-            }
 
         max_iterations = (
             int(max_iterations_override)
@@ -490,122 +789,144 @@ def apply_kinematic_retargeting(
             blend_factor = clamp_to_limits(chain_blend, 0.15, 1.0)
             max_iterations = int(round(max_iterations * blend_factor))
         max_iterations = max(1, max_iterations)
-        for _ in range(max_iterations):
-            # Single update at the start of each iteration gives every bone
-            # consistent world-space positions (Jacobi CCD).  Mid-iteration
-            # batch-updates caused asymmetric corrections within one sweep
-            # and contributed to jitter.
-            bpy.context.view_layer.update()
-            end_world = _get_pose_bone_world_position(urdf_obj, end_bone)
-            dist_error = (target_world - end_world).length
-            if dist_error <= settings.ik_tolerance:
-                break
 
-            made_progress = False
-            for pose_bone in reversed(solver_bones):
-                joint_world = _get_pose_bone_world_position(urdf_obj, pose_bone)
-                end_world = _get_pose_bone_world_position(urdf_obj, end_bone)
-                to_end = end_world - joint_world
-                to_target = target_world - joint_world
+        ref_chain_key = f"ik_r_chain_{chain_key}"
+        if ref_chain_key not in target_cache:
+            ref_data = _compute_custom_default_chain_reference(
+                urdf_obj,
+                settings,
+                solver_bones,
+                end_bone,
+            )
+            if ref_data is not None:
+                target_cache[ref_chain_key] = ref_data
 
-                if to_end.length_squared < 1e-12 or to_target.length_squared < 1e-12:
-                    continue
-
-                axis_world = _get_pose_bone_world_axis(urdf_obj, pose_bone)
-                end_proj = to_end - axis_world * to_end.dot(axis_world)
-                target_proj = to_target - axis_world * to_target.dot(axis_world)
-
-                if (
-                    end_proj.length_squared < 1e-12
-                    or target_proj.length_squared < 1e-12
-                ):
-                    continue
-
-                angle_delta = _signed_angle_around_axis(
-                    end_proj.normalized(),
-                    target_proj.normalized(),
-                    axis_world,
+        ref_data = target_cache.get(ref_chain_key, None)
+        if ref_data is None:
+            # Fallback: keep current state if neutral reference cannot be built.
+            initial_points_world = _collect_chain_points_world(
+                urdf_obj,
+                solver_bones,
+                end_bone,
+            )
+            segment_lengths = [
+                max(
+                    1e-9, (initial_points_world[i + 1] - initial_points_world[i]).length
                 )
-                angle_delta *= chain.influence
-                angle_delta *= chain_blend
-                angle_delta = clamp_to_limits(
-                    angle_delta,
-                    -settings.ik_max_step_angle,
-                    settings.ik_max_step_angle,
-                )
+                for i in range(len(initial_points_world) - 1)
+            ]
+            hinge_axes_world = [
+                _get_pose_bone_world_axis(urdf_obj, pb) for pb in solver_bones
+            ]
+            base_dirs_world = []
+            for i in range(len(initial_points_world) - 1):
+                seg = initial_points_world[i + 1] - initial_points_world[i]
+                if seg.length_squared < 1e-12:
+                    base_dirs_world.append(mathutils.Vector((1, 0, 0)))
+                else:
+                    base_dirs_world.append(seg.normalized())
+        else:
+            points_local = [mathutils.Vector(v) for v in ref_data["points_local"]]
+            segment_lengths = [max(1e-9, float(v)) for v in ref_data["segment_lengths"]]
+            hinge_axes_local = [
+                mathutils.Vector(v) for v in ref_data["hinge_axes_local"]
+            ]
+            base_dirs_local = [mathutils.Vector(v) for v in ref_data["base_dirs_local"]]
 
-                # Ignore tiny near-converged angle corrections to reduce
-                # visible high-frequency jitter.
-                micro_deadzone = max(0.0, settings.ik_micro_deadzone)
-                if (
-                    abs(angle_delta) < micro_deadzone
-                    and dist_error <= settings.ik_tolerance * 3.0
-                ):
-                    continue
+            initial_points_world = [
+                urdf_obj.matrix_world @ p_local for p_local in points_local
+            ]
 
-                # For very small numeric angles, apply a tiny signed nudge if
-                # the end-effector is still far from target to avoid stalling.
-                if abs(angle_delta) < 1e-5 and dist_error > settings.ik_tolerance * 4.0:
-                    sign = (
-                        1.0 if axis_world.dot(to_end.cross(to_target)) >= 0.0 else -1.0
-                    )
-                    angle_delta = sign * min(settings.ik_max_step_angle, 0.01)
+            root_world_now = _get_pose_bone_world_position(urdf_obj, solver_bones[0])
+            root_shift = root_world_now - initial_points_world[0]
+            initial_points_world = [p + root_shift for p in initial_points_world]
 
-                if abs(angle_delta) < 1e-7:
-                    continue
+            world_rot = urdf_obj.matrix_world.to_3x3()
+            hinge_axes_world = []
+            for axis_local in hinge_axes_local:
+                axis_world = world_rot @ axis_local
+                if axis_world.length_squared < 1e-12:
+                    axis_world = mathutils.Vector((0, 1, 0))
+                else:
+                    axis_world.normalize()
+                hinge_axes_world.append(axis_world)
 
-                joint_type = get_bone_property(pose_bone, "joint_type", "revolute")
-                current_angle = get_bone_property(pose_bone, "_joint_angle", 0.0)
-                _apply_final_angle(pose_bone, current_angle + angle_delta, joint_type)
-                made_progress = True
+            base_dirs_world = []
+            for dir_local in base_dirs_local:
+                dir_world = world_rot @ dir_local
+                if dir_world.length_squared < 1e-12:
+                    dir_world = mathutils.Vector((1, 0, 0))
+                else:
+                    dir_world.normalize()
+                base_dirs_world.append(dir_world)
 
-            if not made_progress:
-                break
+        fabrik_points, iters_used, final_residual = _solve_fabrik_c_positions(
+            initial_points_world,
+            target_world,
+            segment_lengths,
+            max_iterations=max_iterations,
+            tolerance=settings.ik_tolerance,
+            hinge_axes_world=hinge_axes_world,
+            hinge_base_dirs_world=base_dirs_world,
+            target_orientation=desired_end_world_q,
+            orientation_weight=orient_weight,
+        )
 
-        # Guarantee world-space transforms reflect the final solved state before
-        # the post-solver pass and the rest of the retargeting pipeline.
+        total_iters += float(iters_used)
+        total_residual += float(final_residual)
+        solved_chains += 1
+
+        current_points = _collect_chain_points_world(urdf_obj, solver_bones, end_bone)
+        for i, pose_bone in enumerate(solver_bones):
+            to_cur = current_points[i + 1] - current_points[i]
+            to_des = fabrik_points[i + 1] - fabrik_points[i]
+
+            if to_cur.length_squared < 1e-12 or to_des.length_squared < 1e-12:
+                continue
+
+            axis_world = _get_pose_bone_world_axis(urdf_obj, pose_bone)
+            cur_proj = to_cur - axis_world * to_cur.dot(axis_world)
+            des_proj = to_des - axis_world * to_des.dot(axis_world)
+            if cur_proj.length_squared < 1e-12 or des_proj.length_squared < 1e-12:
+                continue
+
+            angle_delta = _signed_angle_around_axis(
+                cur_proj.normalized(),
+                des_proj.normalized(),
+                axis_world,
+            )
+
+            angle_delta *= chain.influence
+            angle_delta *= chain_blend
+            angle_delta = clamp_to_limits(
+                angle_delta,
+                -settings.ik_max_step_angle,
+                settings.ik_max_step_angle,
+            )
+
+            if abs(angle_delta) < 1e-7:
+                continue
+
+            joint_type = get_bone_property(pose_bone, "joint_type", "revolute")
+            current_angle = get_bone_property(pose_bone, "_joint_angle", 0.0)
+            _apply_final_angle(pose_bone, current_angle + angle_delta, joint_type)
+
         bpy.context.view_layer.update()
 
-        # --- Post-solver temporal EMA smoothing ---
-        # Applied AFTER full CCD convergence so the previous-frame memory in
-        # _ik_last_angle does not resist the solver mid-iteration.  The EMA
-        # compares this frame's converged angle against last frame's final
-        # smoothed angle — a clean cross-frame operation with no side-effects
-        # on intra-frame convergence.
-        if joint_smooth > 0.0:
-            for pb in solver_bones:
-                final_angle = get_bone_property(pb, "_joint_angle", 0.0)
-                prev_angle = prev_frame_angles.get(pb.name, final_angle)
-                jtype = get_bone_property(pb, "joint_type", "revolute")
-                smoothed = apply_exponential_smoothing(
-                    final_angle, prev_angle, joint_smooth
-                )
-                set_bone_property(pb, "_ik_last_angle", smoothed)
-                _apply_final_angle(pb, smoothed, jtype)
-            bpy.context.view_layer.update()
+    if solved_chains > 0:
+        scene["_ik_fabrik_avg_iters"] = total_iters / float(solved_chains)
+        scene["_ik_fabrik_avg_residual"] = total_residual / float(solved_chains)
+        scene["_ik_fabrik_chains"] = solved_chains
+    else:
+        scene["_ik_fabrik_avg_iters"] = 0.0
+        scene["_ik_fabrik_avg_residual"] = 0.0
+        scene["_ik_fabrik_chains"] = 0
 
 
 def get_lowest_z_world(urdf_obj: bpy.types.Object) -> float:
     """
     Find the lowest Z-coordinate (height) of all visual meshes in world space.
 
-                    set_bone_property(pb, "_ik_last_angle", smoothed)
-                    _apply_final_angle(pb, smoothed, jtype)
-                bpy.context.view_layer.update()
-
-            # Sync FK memory to IK-corrected output so the FK baseline in the
-            # next frame starts from the actual output position, not a stale
-            # pure-FK value.  This prevents IK from having to redo the same
-            # offset correction on every frame (FK-IK fighting).
-            for pb in solver_bones:
-                set_bone_property(
-                    pb,
-                    "_last_urdf_angle",
-                    get_bone_property(pb, "_joint_angle", 0.0),
-                )
-
-
-    def get_lowest_z_world(urdf_obj: bpy.types.Object) -> float:
     Returns:
         The minimum Z-coordinate found. If no meshes exist, uses bone positions.
     """
@@ -650,19 +971,20 @@ def detect_stance_foot(
         settings: BVHMappingSettings with foot bone names and jump_threshold.
 
     Returns:
-        (anchor_bone_name, is_anchor_switch, both_grounded)
-        anchor_bone_name is "" when both feet are airborne (jump).
-        both_grounded is True when both feet are in contact with the ground
-        (double-support phase).  During double-support, yaw rotation
-        correction should be suppressed because pivoting around one foot
-        would move the other.
+        (anchor_bone_name, is_switch, both_grounded)
+        anchor_bone_name: active stance foot bone name or "" if airborne.
+        is_switch: True if anchor switched from previous frame.
+        both_grounded: True when both feet are currently grounded.
     """
     bvh_floor_offset = scene.get("bvh_floor_offset", 0.0)
 
-    # --- velocity tracking ---
     if "_foot_positions" not in scene:
         scene["_foot_positions"] = {}
+
     last_positions = scene["_foot_positions"]
+    scene["_foot_positions_prev"] = {
+        name: tuple(pos) for name, pos in last_positions.items()
+    }
     if "_foot_contact_state" not in scene:
         scene["_foot_contact_state"] = {}
     contact_state = scene["_foot_contact_state"]
@@ -734,27 +1056,70 @@ def detect_stance_foot(
     return anchor_bone_name, is_switch, both_grounded
 
 
+def _apply_output_post_processing(
+    urdf_obj,
+    settings,
+    smooth_cache: dict,
+    scene,
+) -> None:
+    """
+    Apply continuity correction, velocity limiting and EMA smoothing to all
+    URDF joint outputs after FK, IK and foot alignment have all written to
+    ``_joint_angle``.  Uniform stabilisation for all motion sources.
+    """
+    target_hz = scene.render.fps if scene.render.fps > 0 else 60.0
+    dt = 1.0 / target_hz
+
+    for pose_bone in urdf_obj.pose.bones:
+        jtype = get_bone_property(pose_bone, "joint_type", "revolute")
+        if jtype not in {"revolute", "continuous"}:
+            continue
+
+        raw_angle = get_bone_property(pose_bone, "_joint_angle", 0.0)
+
+        # Continuity correction - prevents +/-2pi jumps
+        cont_key = "pp_c_" + pose_bone.name
+        if cont_key in smooth_cache:
+            raw_angle = apply_continuity_correction(
+                raw_angle, smooth_cache[cont_key], settings.max_jump_threshold
+            )
+        smooth_cache[cont_key] = raw_angle
+
+        # Velocity limiting
+        vel_key = "pp_v_" + pose_bone.name
+        prev_raw = smooth_cache.get(vel_key, raw_angle)
+        velocity_limit = get_bone_property(pose_bone, "velocity_limit", 10.0)
+        raw_angle, was_limited = apply_velocity_limiting(
+            raw_angle, prev_raw, velocity_limit, dt
+        )
+        set_bone_property(pose_bone, "is_velocity_limited", was_limited)
+        smooth_cache[vel_key] = raw_angle
+
+        # EMA smoothing
+        last_angle = get_bone_property(pose_bone, "_last_urdf_angle", raw_angle)
+        final_angle = apply_exponential_smoothing(
+            raw_angle, last_angle, settings.joint_smoothing
+        )
+        set_bone_property(pose_bone, "_last_urdf_angle", final_angle)
+
+        _apply_final_angle(pose_bone, final_angle, jtype)
+
+
 def apply_joint_retargeting(
-    urdf_obj: bpy.types.Object,
-    bvh_obj: bpy.types.Object,
+    urdf_obj,
+    bvh_obj,
     mapping_item,
     smooth_cache: dict,
     settings,
-    scene: bpy.types.Scene,
+    scene,
 ) -> None:
     """
     Retarget a single joint mapping from BVH to URDF.
 
-    Extracts the per-axis rotation component from the BVH bone, applies continuity
-    corrections, velocity limiting, and smoothing, then outputs to the URDF bone.
-
-    Args:
-        urdf_obj: The URDF armature object.
-        bvh_obj: The BVH source armature object.
-        mapping_item: A BVHMappingItem defining the BVH-to-URDF mapping.
-        smooth_cache: Dictionary for caching continuity and smoothing state.
-        settings: BVHMappingSettings with smoothing factors.
-        scene: The Blender scene (for FPS and frame data).
+    Extracts the per-axis rotation component from the BVH bone and writes the
+    raw target angle via _apply_final_angle.  Continuity correction, velocity
+    limiting and EMA smoothing are applied afterward by
+    _apply_output_post_processing so all motion sources benefit equally.
     """
     bvh_b = bvh_obj.pose.bones.get(mapping_item.bvh_bone_name)
     if not bvh_b:
@@ -762,52 +1127,24 @@ def apply_joint_retargeting(
 
     default_joint_angles = _get_custom_default_joint_angles(settings)
 
-    # Calculate the delta rotation relative to the reference (T-Pose)
     ref_q = mathutils.Quaternion(mapping_item.ref_rot)
     current_q = bvh_b.matrix_basis.to_quaternion()
     delta_q = ref_q.inverted() @ current_q
 
-    # A single BVH bone might drive multiple URDF joints
     for urdf_bone_mapping in mapping_item.urdf_bones:
         urdf_b = urdf_obj.pose.bones.get(urdf_bone_mapping.urdf_bone_name)
         if not urdf_b:
             continue
 
-        # Only handle revolute and continuous joints
         jtype = get_bone_property(urdf_b, "joint_type", "revolute")
         if jtype not in {"revolute", "continuous"}:
             continue
 
-        # Extract rotation around the selected twist axis
         twist_axis = _AXIS_VECTORS.get(
             urdf_bone_mapping.source_axis, _AXIS_VECTORS["Z"]
         )
         val = extract_twist_angle(delta_q, twist_axis)
 
-        # Apply continuity correction (anti-flip)
-        cache_val_key = f"val_{bvh_obj.name}_{urdf_bone_mapping.urdf_bone_name}"
-        if cache_val_key in smooth_cache:
-            prev_val = smooth_cache[cache_val_key]
-            val = apply_continuity_correction(
-                val, prev_val, settings.max_jump_threshold
-            )
-        smooth_cache[cache_val_key] = val
-
-        # Apply velocity limiting
-        velocity_limit = get_bone_property(urdf_b, "velocity_limit", 10.0)
-        last_raw_key = f"last_raw_{bvh_obj.name}_{urdf_bone_mapping.urdf_bone_name}"
-        last_raw_val = smooth_cache.get(last_raw_key, val)
-
-        target_hz = scene.render.fps if scene.render.fps > 0 else 60.0
-        dt = 1.0 / target_hz
-
-        val, was_limited = apply_velocity_limiting(
-            val, last_raw_val, velocity_limit, dt
-        )
-        set_bone_property(urdf_b, "is_velocity_limited", was_limited)
-        smooth_cache[last_raw_key] = val
-
-        # Apply sign and neutral offset
         if urdf_bone_mapping.sign == "NEG":
             val = -val
 
@@ -815,9 +1152,6 @@ def apply_joint_retargeting(
             set_bone_property(urdf_b, "offset", val)
 
         default_pose_offset = default_joint_angles.get(urdf_b.name, 0.0)
-
-        # Combine retarget delta with calibration offset, optional custom
-        # default-pose base angle, and the user-authored neutral offset.
         target_angle = (
             default_pose_offset
             + val
@@ -825,15 +1159,8 @@ def apply_joint_retargeting(
             + urdf_bone_mapping.neutral_offset
         )
 
-        # Apply exponential smoothing
-        last_angle = get_bone_property(urdf_b, "_last_urdf_angle", target_angle)
-        final_angle = apply_exponential_smoothing(
-            target_angle, last_angle, settings.joint_smoothing
-        )
-        set_bone_property(urdf_b, "_last_urdf_angle", final_angle)
-
-        # Clamp, store and apply
-        _apply_final_angle(urdf_b, final_angle, jtype)
+        # Write raw target angle; _apply_output_post_processing handles the rest
+        _apply_final_angle(urdf_b, target_angle, jtype)
 
 
 def apply_foot_alignment(
@@ -955,14 +1282,12 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
         1. Set URDF root = BVH_delta + persistent_correction + manual offset
         2. Set URDF root rotation from BVH (axis-corrected, damped)
            + persistent yaw correction
-        3. Joint retargeting (FK)
-        4. Foot alignment (flatten near ground)
-        5. scene update
-        6. Detect stance foot  →  measure URDF foot world transform
-        7a. Yaw residual  →  increment persistent yaw, pivot (single-support)
-                              or rotate-in-place (double-support)
-        7b. XY drift      →  correct root, update persistent translation
-        7c. Correction decay → pull persistent offsets toward BVH
+        3. Stance detection + IK pin setup
+        4. Joint retargeting (FK + IK)
+        5. Foot alignment
+        5b. Output post-processing (continuity, velocity limiting, EMA)
+        6. Scene update
+        7. Sticky-foot correction
         8. Anti-sinking guard
 
     Args:
@@ -995,14 +1320,18 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
         scene["_persistent_foot_correction"] = mathutils.Vector((0, 0, 0))
         scene["_persistent_foot_rot_correction"] = mathutils.Quaternion((1, 0, 0, 0))
         scene["_active_anchor_name"] = ""
+        scene["_anchor_world_pos"] = None
         scene["_anchor_world_pos_xy"] = None
         scene["_anchor_world_yaw"] = None
         scene["_anchor_bvh_yaw"] = None
+        scene["_ik_solver_pin_anchor"] = ""
+        scene["_ik_solver_pin_pos"] = None
         scene["_foot_positions"] = {}
+        scene["_foot_positions_prev"] = {}
         scene["_foot_contact_state"] = {}
 
     # ------------------------------------------------------------------
-    # 1.  BVH root position  (scaled delta from reference)
+    # 1. BVH root position (scaled delta from reference)
     # ------------------------------------------------------------------
     bvh_root_mat = bvh.matrix_world @ bvh.pose.bones[0].matrix
     current_bvh_pos = bvh_root_mat.to_translation()
@@ -1016,7 +1345,6 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
         )
     )
 
-    # Persistent correction carries the accumulated foot-pinning offset
     persistent_correction = mathutils.Vector(
         scene.get("_persistent_foot_correction", (0, 0, 0))
     )
@@ -1029,7 +1357,7 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     urdf.location = bvh_delta + persistent_correction + loc_offset
 
     # ------------------------------------------------------------------
-    # 2.  BVH root rotation  (axis-corrected, pitch/roll damped)
+    # 2. BVH root rotation (axis-corrected, pitch/roll damped)
     # ------------------------------------------------------------------
     ref_rot = mathutils.Quaternion(scene.get("ref_root_rot", (1, 0, 0, 0)))
     off_q = mathutils.Euler(settings.rotation_offset).to_quaternion()
@@ -1062,27 +1390,53 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     )
 
     # ------------------------------------------------------------------
-    # 3.  Joint retargeting  (angle extraction or kinematic IK)
+    # 3. Stance detection + solver pin setup (before IK)
     # ------------------------------------------------------------------
-    t_stage_start = time.perf_counter()
+    anchor_bone_name, is_anchor_switch, both_grounded = detect_stance_foot(
+        scene, bvh, settings
+    )
+    last_anchor = scene.get("_active_anchor_name", "")
+    is_first_anchor = anchor_bone_name != "" and last_anchor == ""
 
-    # Legacy scene compatibility: ANGLE/KINEMATIC values are treated as HYBRID.
-    if settings.retargeting_method != "HYBRID":
-        settings.retargeting_method = "HYBRID"
+    solver_pin_anchor = ""
+    solver_pin_pos = None
+    if anchor_bone_name and not is_anchor_switch and not is_first_anchor:
+        anchor_world_pos = scene.get("_anchor_world_pos", None)
+        if anchor_world_pos is not None:
+            solver_pin_anchor = anchor_bone_name
+            solver_pin_pos = (
+                anchor_world_pos[0],
+                anchor_world_pos[1],
+                anchor_world_pos[2],
+            )
 
+    scene["_ik_solver_pin_anchor"] = solver_pin_anchor
+    scene["_ik_solver_pin_pos"] = solver_pin_pos
+
+    # ------------------------------------------------------------------
+    # 4. Joint retargeting (FK baseline + IK correction)
+    # ------------------------------------------------------------------
     t_fk_start = time.perf_counter()
-    for item in settings.mappings:
-        apply_joint_retargeting(urdf, bvh, item, smooth_cache, settings, scene)
+    if not settings.ik_only_mode:
+        for item in settings.mappings:
+            apply_joint_retargeting(urdf, bvh, item, smooth_cache, settings, scene)
     scene["_retarget_ms_fk"] = (time.perf_counter() - t_fk_start) * 1000.0
 
     export_full_quality = bool(scene.get("_export_full_quality", False))
 
-    # Performance shortcut: pure FK mode when IK blend is zero.
-    if settings.hybrid_ik_blend <= 1e-6:
+    ik_blend = clamp_to_limits(settings.hybrid_ik_blend, 0.0, 1.0)
+    if settings.ik_only_mode:
+        ik_blend = 1.0
+
+    if ik_blend <= 1e-6:
         scene["_retarget_ms_ik"] = 0.0
     else:
         hybrid_iterations_override = None
-        if settings.hybrid_realtime_guard and not export_full_quality:
+        if (
+            settings.hybrid_realtime_guard
+            and not export_full_quality
+            and not settings.ik_only_mode
+        ):
             avg_ms = scene.get("_retarget_ms_ema", None)
             fps = scene.render.fps if scene.render.fps > 0 else 60.0
             budget_ms = 1000.0 / fps
@@ -1095,54 +1449,34 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
                     max(1, target_iter),
                 )
 
-        ik_skip = (
-            0
-            if export_full_quality
-            else max(0, int(getattr(settings, "hybrid_ik_frame_skip", 0)))
-        )
-        run_ik_this_frame = (scene.frame_current % (ik_skip + 1)) == 0
         t_ik_start = time.perf_counter()
-        if run_ik_this_frame:
-            iter_override = hybrid_iterations_override
-            blend_override = settings.hybrid_ik_blend
-        else:
-            # Keep a tiny IK pass on skipped frames to prevent visible
-            # oscillation from alternating FK-only / FK+IK states.
-            iter_override = 1
-            blend_override = settings.hybrid_ik_blend * 0.35
-
         apply_kinematic_retargeting(
             urdf,
             bvh,
             settings,
             scene,
-            correction_blend=blend_override,
-            max_iterations_override=iter_override,
+            correction_blend=ik_blend,
+            max_iterations_override=hybrid_iterations_override,
         )
         scene["_retarget_ms_ik"] = (time.perf_counter() - t_ik_start) * 1000.0
 
     # ------------------------------------------------------------------
-    # 4.  Foot alignment  (flatten near ground)
+    # 5. Foot alignment (flatten near ground)
     # ------------------------------------------------------------------
     apply_foot_alignment(urdf, bvh, settings, smooth_cache, scene)
 
     # ------------------------------------------------------------------
-    # 5.  Scene update so matrix_world is current for the measurement step
+    # 5b. Shared output post-processing (continuity, velocity, EMA)
+    # ------------------------------------------------------------------
+    _apply_output_post_processing(urdf, settings, smooth_cache, scene)
+
+    # ------------------------------------------------------------------
+    # 6. Scene update so matrix_world is current for measurement
     # ------------------------------------------------------------------
     bpy.context.view_layer.update()
 
     # ------------------------------------------------------------------
-    # 6.  Detect stance foot  (BVH space)
-    # ------------------------------------------------------------------
-    anchor_bone_name, is_anchor_switch, both_grounded = detect_stance_foot(
-        scene, bvh, settings
-    )
-
-    last_anchor = scene.get("_active_anchor_name", "")
-    is_first_anchor = anchor_bone_name != "" and last_anchor == ""
-
-    # ------------------------------------------------------------------
-    # 7.  Sticky-foot correction  (yaw rotation + XY translation)
+    # 7. Sticky-foot correction (yaw rotation + XY translation)
     # ------------------------------------------------------------------
     if anchor_bone_name:
         urdf_foot_bone = _find_urdf_foot_for_anchor(anchor_bone_name, settings, urdf)
@@ -1153,15 +1487,10 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
             foot_yaw = _extract_yaw(foot_world_mat)
 
             if is_anchor_switch or is_first_anchor:
-                # ---  New anchor  ---
-                # Record where the foot IS right now (already includes all
-                # previous corrections via persistent_correction).
-                # No drift correction this frame → seamless transition.
+                scene["_anchor_world_pos"] = (foot_world.x, foot_world.y, foot_world.z)
                 scene["_anchor_world_pos_xy"] = (foot_world.x, foot_world.y)
                 scene["_anchor_world_yaw"] = foot_yaw
 
-                # Also record the BVH foot yaw at anchor time so we can
-                # distinguish intentional rotation from FK error later.
                 bvh_anchor_bone = bvh.pose.bones.get(anchor_bone_name)
                 if bvh_anchor_bone:
                     bvh_foot_mat = bvh.matrix_world @ bvh_anchor_bone.matrix
@@ -1169,36 +1498,10 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
                 else:
                     scene["_anchor_bvh_yaw"] = None
 
-            # --- 7a.  Rotation correction (yaw / Z-axis) ---
-            #
-            # Persistent, residual-based yaw correction.
-            # Because persistent_rot_correction was already applied in
-            # step 2, the yaw we measure here already includes all
-            # previous corrections.  We therefore only see the RESIDUAL
-            # FK error and increment persistent_rot_correction by that
-            # small amount.  This is self-correcting: when the FK error
-            # vanishes (pose returns to neutral), the residual has the
-            # opposite sign and decays the accumulated correction back
-            # toward identity.  No unbounded growth, no flicker.
-            #
-            # The correction is ALWAYS active (single- AND double-support)
-            # so that yaw drift cannot accumulate in any ground phase.
-            # • Single-support: pivot around the stance foot so it stays
-            #   in place and only the root swings.
-            # • Double-support: rotate root in place (no pivot).  Step 7b
-            #   then re-pins the anchor foot via XY translation.  The
-            #   non-anchor foot may shift minimally, which is acceptable
-            #   for the typically short double-support phases.
-            #
-            # Yaw is extracted via atan2 (gimbal-safe) and differences
-            # are wrapped to [-π, π] to avoid 2π jumps.
             anchor_yaw = scene.get("_anchor_world_yaw", None)
             if anchor_yaw is not None:
-                # How much the URDF foot yaw changed since anchor
                 urdf_yaw_change = _wrap_angle(foot_yaw - anchor_yaw)
 
-                # How much the BVH foot yaw changed since anchor
-                # (= intentional rotation from the motion-capture data)
                 bvh_yaw_change = 0.0
                 anchor_bvh_yaw = scene.get("_anchor_bvh_yaw", None)
                 if anchor_bvh_yaw is not None:
@@ -1209,7 +1512,6 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
                         )
                         bvh_yaw_change = _wrap_angle(cur_bvh_yaw - anchor_bvh_yaw)
 
-                # Residual FK error (what remains after persistent correction)
                 yaw_residual = _wrap_angle(urdf_yaw_change - bvh_yaw_change)
 
                 if abs(yaw_residual) > 1e-6:
@@ -1217,11 +1519,9 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
                     yaw_step = clamp_to_limits(-yaw_residual, -max_yaw, max_yaw)
                     yaw_fix_q = mathutils.Quaternion((0, 0, 1), yaw_step)
 
-                    # --- Rotate root orientation ---
                     urdf.rotation_quaternion = yaw_fix_q @ urdf.rotation_quaternion
 
                     if not both_grounded:
-                        # --- Single-support: Pivot around stance foot ---
                         root_pos = urdf.location.copy()
                         pivot = mathutils.Vector(
                             (foot_world.x, foot_world.y, root_pos.z)
@@ -1230,36 +1530,25 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
                         rotated_offset = yaw_fix_q @ offset_from_pivot
                         urdf.location = pivot + rotated_offset
 
-                        # Persist pivot-induced position shift
                         loc_shift = rotated_offset - offset_from_pivot
                         persistent_correction += loc_shift
                         scene["_persistent_foot_correction"] = persistent_correction
-                    # else: double-support — rotate in place, 7b re-pins
 
-                    # Accumulate into persistent correction for next frame
                     persistent_rot_correction = yaw_fix_q @ persistent_rot_correction
                     scene["_persistent_foot_rot_correction"] = persistent_rot_correction
 
-                    # Scene must update after rotation change so that
-                    # foot position reflects the new orientation before
-                    # we measure XY drift.
                     bpy.context.view_layer.update()
-
-                    # Re-measure foot position after rotation correction
                     foot_world = (
                         urdf.matrix_world @ urdf_foot_bone.matrix
                     ).to_translation()
 
-            # --- 7b.  Translation correction (XY) ---
             anchor_xy = scene.get("_anchor_world_pos_xy", None)
-
             if anchor_xy is not None:
                 anchor_x, anchor_y = anchor_xy
 
                 drift_x = foot_world.x - anchor_x
                 drift_y = foot_world.y - anchor_y
 
-                # Limit per-frame XY correction to avoid visible snapping.
                 max_xy = max(1e-6, settings.foot_pin_xy_max_step)
                 drift_len = math.hypot(drift_x, drift_y)
                 if drift_len > max_xy:
@@ -1267,11 +1556,9 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
                     drift_x *= scale
                     drift_y *= scale
 
-                # Correct root 100 % — translation is additive, so this is exact
                 urdf.location.x -= drift_x
                 urdf.location.y -= drift_y
 
-                # Write correction back so it carries into next frame
                 persistent_correction.x -= drift_x
                 persistent_correction.y -= drift_y
                 scene["_persistent_foot_correction"] = persistent_correction
@@ -1279,45 +1566,32 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
         scene["_active_anchor_name"] = anchor_bone_name
 
     else:
-        # Both feet airborne (jump) — freeze correction, clear anchor.
-        # persistent corrections (translation + rotation) are NOT modified,
-        # so the offsets from the last stance phase are preserved and
-        # landing is seamless.
         scene["_active_anchor_name"] = ""
+        scene["_anchor_world_pos"] = None
         scene["_anchor_world_pos_xy"] = None
         scene["_anchor_world_yaw"] = None
         scene["_anchor_bvh_yaw"] = None
+        scene["_ik_solver_pin_anchor"] = ""
+        scene["_ik_solver_pin_pos"] = None
 
     # ------------------------------------------------------------------
-    # 7c.  Correction decay — pull persistent offsets toward BVH
-    #
-    # Without decay the persistent corrections accumulate without
-    # bound, causing the URDF root to drift away from the BVH
-    # trajectory.  A small per-frame decay acts as a leaky
-    # integrator: foot-planting adds corrections, decay removes
-    # them.  The anchors are shifted by the same amount so the
-    # foot-planting loop does not immediately re-introduce what
-    # was decayed — the net effect is a smooth pull back toward
-    # the original BVH motion path.
+    # 7c. Correction decay - pull persistent offsets toward BVH
     # ------------------------------------------------------------------
     target_hz = scene.render.fps if scene.render.fps > 0 else 120.0
-    _REF_FPS = 120.0
-    # UI value is a readable percentage-like number (default 0.05).
-    # Divide by 100 to obtain the actual per-frame rate at 120 FPS
-    # (0.05 → 0.005 per frame → 0.5% decay per frame).
+    ref_fps = 120.0
     raw_decay = settings.correction_decay / 10.0
-    # FPS-independent decay: the configured rate is defined at 120 FPS.
-    # At other frame-rates we adjust so the per-second decay stays equal.
-    #   (1 - adjusted)^fps == (1 - raw_decay)^120
-    #   adjusted = 1 - (1 - raw_decay)^(120 / fps)
     if raw_decay >= 0.1:
         decay_rate = 1.0
     elif raw_decay > 0.0:
-        decay_rate = 1.0 - (1.0 - raw_decay) ** (_REF_FPS / target_hz)
+        decay_rate = 1.0 - (1.0 - raw_decay) ** (ref_fps / target_hz)
     else:
         decay_rate = 0.0
-    if decay_rate > 0.0:
-        # Re-read (step 7 may have modified them)
+
+    decay_allowed = True
+    if settings.correction_decay_airborne_only and anchor_bone_name:
+        decay_allowed = False
+
+    if decay_rate > 0.0 and decay_allowed:
         persistent_correction = mathutils.Vector(
             scene.get("_persistent_foot_correction", (0, 0, 0))
         )
@@ -1325,7 +1599,6 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
             scene.get("_persistent_foot_rot_correction", (1, 0, 0, 0))
         )
 
-        # --- Translation decay (XY only, Z handled by anti-sinking) ---
         decay_x = persistent_correction.x * decay_rate
         decay_y = persistent_correction.y * decay_rate
         persistent_correction.x -= decay_x
@@ -1338,7 +1611,14 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
                 anchor_xy[1] - decay_y,
             )
 
-        # --- Rotation decay (yaw around Z) ---
+        anchor_pos = scene.get("_anchor_world_pos", None)
+        if anchor_pos is not None:
+            scene["_anchor_world_pos"] = (
+                anchor_pos[0] - decay_x,
+                anchor_pos[1] - decay_y,
+                anchor_pos[2],
+            )
+
         identity_q = mathutils.Quaternion((1, 0, 0, 0))
         old_yaw = 2.0 * math.atan2(
             persistent_rot_correction.z, persistent_rot_correction.w
@@ -1355,12 +1635,11 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
         if anchor_yaw is not None:
             scene["_anchor_world_yaw"] = anchor_yaw - yaw_removed
 
-        # Store decayed values
         scene["_persistent_foot_correction"] = persistent_correction
         scene["_persistent_foot_rot_correction"] = persistent_rot_correction
 
     # ------------------------------------------------------------------
-    # 8.  Anti-sinking guard
+    # 8. Anti-sinking guard
     # ------------------------------------------------------------------
     t_sink_start = time.perf_counter()
     bpy.context.view_layer.update()
@@ -1370,7 +1649,6 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
         urdf.location.z += abs(current_min_z)
     scene["_retarget_ms_sink"] = (time.perf_counter() - t_sink_start) * 1000.0
 
-    # Runtime telemetry (EMA) for quick realtime tuning feedback in UI.
     elapsed_ms = (time.perf_counter() - t_start) * 1000.0
     prev_ms = scene.get("_retarget_ms_ema", None)
     if prev_ms is None:

@@ -9,6 +9,7 @@ PRESET_SETTING_FIELDS = [
     "retargeting_method",
     "bvh_smoothing",
     "joint_smoothing",
+    "ik_only_mode",
     "max_jump_threshold",
     "ik_iterations",
     "ik_tolerance",
@@ -17,17 +18,13 @@ PRESET_SETTING_FIELDS = [
     "ik_proportion_blend",
     "ik_ground_lock_strength",
     "ik_target_smoothing",
-    "ik_joint_smoothing",
-    "ik_micro_deadzone",
     "hybrid_ik_blend",
     "hybrid_adaptive_ik",
     "hybrid_min_ik_blend",
     "hybrid_error_low",
     "hybrid_error_high",
-    "hybrid_blend_smoothing",
     "hybrid_realtime_guard",
     "hybrid_min_iterations",
-    "hybrid_ik_frame_skip",
     "foot_l_name",
     "foot_r_name",
     "jump_threshold",
@@ -37,11 +34,11 @@ PRESET_SETTING_FIELDS = [
     "foot_pin_xy_max_step",
     "foot_pin_yaw_max_step",
     "correction_decay",
+    "correction_decay_airborne_only",
     "root_scale",
     "location_offset",
     "rotation_offset",
     "target_hz",
-    "use_custom_default_pose",
     "default_pose_root_rotation",
     "import_use_meta_hz",
     "import_manual_hz",
@@ -168,9 +165,6 @@ def import_mapping_from_json(filepath, settings):
             # Keep import robust against version mismatches.
             continue
 
-    # Neutral pose is always active now; keep the stored flag only for
-    # backward-compatible preset roundtripping.
-    settings.use_custom_default_pose = True
     if hasattr(settings, "default_pose_root_rotation"):
         r = settings.default_pose_root_rotation
         settings.default_pose_root_rotation = (r[0], r[1], 0.0)

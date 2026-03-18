@@ -223,18 +223,8 @@ class BVHMappingSettings(PropertyGroup):
     )
     retargeting_method: EnumProperty(
         name="Retargeting Method",
-        description="Select the retargeting backend (ANGLE/KINEMATIC are legacy and mapped to HYBRID at runtime)",
+        description="Retargeting backend",
         items=[
-            (
-                "ANGLE",
-                "Angle Mapping (Legacy)",
-                "Legacy mode kept for old scenes; runtime uses HYBRID",
-            ),
-            (
-                "KINEMATIC",
-                "Kinematic IK (Legacy)",
-                "Legacy mode kept for old scenes; runtime uses HYBRID",
-            ),
             (
                 "HYBRID",
                 "Hybrid FK + IK",
@@ -289,6 +279,11 @@ class BVHMappingSettings(PropertyGroup):
         min=0.0,
         max=1.0,
     )
+    ik_only_mode: BoolProperty(
+        name="IK Only Mode",
+        description="Skip FK baseline and solve motion using IK chains only",
+        default=False,
+    )
     max_jump_threshold: FloatProperty(
         name="Max Jump Threshold",
         description="Maximum allowed angle jump in radians (rejects larger jumps as extraction artifacts)",
@@ -299,7 +294,7 @@ class BVHMappingSettings(PropertyGroup):
     )
     ik_iterations: IntProperty(
         name="IK Iterations",
-        description="Maximum CCD iterations per kinematic chain and frame",
+        description="Maximum FABRIK iterations per kinematic chain and frame",
         default=12,
         min=1,
         max=64,
@@ -372,21 +367,6 @@ class BVHMappingSettings(PropertyGroup):
         min=0.0,
         max=0.98,
     )
-    ik_joint_smoothing: FloatProperty(
-        name="IK Joint Smoothing",
-        description="Low-pass smoothing on solved IK joint angles",
-        default=0.12,
-        min=0.0,
-        max=1.0,
-    )
-    ik_micro_deadzone: FloatProperty(
-        name="IK Micro Deadzone",
-        description="Ignore tiny IK angle updates near convergence to reduce micro-jitter",
-        default=0.0015,
-        min=0.0,
-        max=0.05,
-        subtype="ANGLE",
-    )
     hybrid_ik_blend: FloatProperty(
         name="Hybrid IK Blend",
         description="Strength of IK correction on top of FK baseline (0 = FK only, 1 = full IK correction)",
@@ -425,13 +405,6 @@ class BVHMappingSettings(PropertyGroup):
         max=0.5,
         subtype="DISTANCE",
     )
-    hybrid_blend_smoothing: FloatProperty(
-        name="Hybrid Blend Smoothing",
-        description="Temporal smoothing of adaptive per-chain IK blend (higher = smoother)",
-        default=0.8,
-        min=0.0,
-        max=0.98,
-    )
     hybrid_realtime_guard: BoolProperty(
         name="Hybrid Realtime Guard",
         description=(
@@ -446,16 +419,6 @@ class BVHMappingSettings(PropertyGroup):
         default=4,
         min=1,
         max=64,
-    )
-    hybrid_ik_frame_skip: IntProperty(
-        name="Hybrid IK Frame Skip",
-        description=(
-            "Skip N frames between Hybrid IK passes (0 = IK every frame, "
-            "1 = every second frame)"
-        ),
-        default=0,
-        min=0,
-        max=8,
     )
 
     # Foot Contact & Anchoring
@@ -540,6 +503,11 @@ class BVHMappingSettings(PropertyGroup):
         max=1.0,
         step=0.01,
     )
+    correction_decay_airborne_only: BoolProperty(
+        name="Decay Airborne Only",
+        description="Apply correction decay only when no stance foot is grounded",
+        default=True,
+    )
 
     # Root Motion
     root_scale: FloatProperty(
@@ -598,12 +566,6 @@ class BVHMappingSettings(PropertyGroup):
         description="Duration in seconds to hold the final exported pose at the end",
         default=0.0,
         min=0.0,
-    )
-    use_custom_default_pose: BoolProperty(
-        name="Use Neutral Pose",
-        description="Legacy compatibility flag for the stored neutral pose settings",
-        default=True,
-        options={"HIDDEN"},
     )
     default_pose_root_rotation: FloatVectorProperty(
         name="Neutral Root Rotation",
