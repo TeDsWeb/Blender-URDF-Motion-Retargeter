@@ -200,6 +200,19 @@ class PANEL_MotionOptions(Panel):
                 text=f"FABRIK Residual: {fabrik_residual:.4f} m",
                 icon="TRACKING_REFINE_FORWARDS",
             )
+        ps_min = context.scene.get("_ik_proportion_scale_min", None)
+        ps_max = context.scene.get("_ik_proportion_scale_max", None)
+        if ps_min is not None and ps_max is not None and float(ps_max) > 0.0:
+            perf_box.label(
+                text=f"Proportion Scale: {float(ps_min):.3f} – {float(ps_max):.3f}",
+                icon="DRIVER_DISTANCE",
+            )
+        dz_max = context.scene.get("_ik_motion_delta_z_max", None)
+        if dz_max is not None:
+            perf_box.label(
+                text=f"Motion Delta Z max: {float(dz_max):.4f} m",
+                icon="SORT_DESC",
+            )
         fk_ms = context.scene.get("_retarget_ms_fk", None)
         if fk_ms is not None:
             perf_box.label(text=f"FK Stage: {fk_ms:.2f} ms", icon="BONE_DATA")
@@ -396,8 +409,16 @@ class PANEL_KinematicChains(Panel):
                     "bones",
                     text="BVH Target",
                 )
+                box.prop_search(
+                    chain,
+                    "bvh_root_bone_name",
+                    scene.bvh_rig_object.pose,
+                    "bones",
+                    text="BVH Root (optional)",
+                )
             else:
                 box.prop(chain, "bvh_target_bone_name")
+                box.prop(chain, "bvh_root_bone_name")
 
             if scene.urdf_rig_object:
                 box.prop_search(

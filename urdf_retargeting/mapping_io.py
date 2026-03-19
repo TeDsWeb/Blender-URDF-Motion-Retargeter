@@ -124,6 +124,7 @@ def export_mapping_to_json(filepath, settings, metadata=None):
             {
                 "label": chain.label,
                 "bvh_target_bone_name": chain.bvh_target_bone_name,
+                "bvh_root_bone_name": chain.bvh_root_bone_name,
                 "urdf_root_bone_name": chain.urdf_root_bone_name,
                 "urdf_end_bone_name": chain.urdf_end_bone_name,
                 "influence": chain.influence,
@@ -159,6 +160,12 @@ def import_mapping_from_json(filepath, settings):
         if not hasattr(settings, key):
             continue
         try:
+            if key == "retargeting_method":
+                value = {
+                    "0": "FK_ONLY",
+                    "1": "IK_ONLY",
+                    "2": "HYBRID",
+                }.get(str(value), value)
             current_value = getattr(settings, key)
             if isinstance(value, list) and not isinstance(current_value, str):
                 setattr(settings, key, tuple(value))
@@ -193,6 +200,7 @@ def import_mapping_from_json(filepath, settings):
         chain = settings.kinematic_chains.add()
         chain.label = c.get("label", "")
         chain.bvh_target_bone_name = c.get("bvh_target_bone_name", "")
+        chain.bvh_root_bone_name = c.get("bvh_root_bone_name", "")
         chain.urdf_root_bone_name = c.get("urdf_root_bone_name", "")
         chain.urdf_end_bone_name = c.get("urdf_end_bone_name", "")
         chain.influence = float(c.get("influence", 1.0))

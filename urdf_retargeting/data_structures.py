@@ -97,6 +97,11 @@ class KinematicChainMapping(PropertyGroup):
         description="BVH end-effector bone whose position should be matched",
         default="",
     )
+    bvh_root_bone_name: StringProperty(
+        name="BVH Root",
+        description="Optional BVH root bone for chain-length estimation (ancestor of BVH Target)",
+        default="",
+    )
     urdf_root_bone_name: StringProperty(
         name="URDF Root Joint",
         description="First URDF joint in the kinematic chain",
@@ -111,6 +116,13 @@ class KinematicChainMapping(PropertyGroup):
         name="Influence",
         description="How strongly the IK chain should follow the BVH target",
         default=1.0,
+        min=0.0,
+        max=1.0,
+    )
+    orientation_weight: FloatProperty(
+        name="Orientation Weight",
+        description="How strongly the IK solver targets end-effector orientation (0=position only, 1=full orientation)",
+        default=0.55,
         min=0.0,
         max=1.0,
     )
@@ -225,6 +237,16 @@ class BVHMappingSettings(PropertyGroup):
         name="Retargeting Method",
         description="Retargeting backend",
         items=[
+            (
+                "FK_ONLY",
+                "FK Only",
+                "Use FK mapping only without IK correction",
+            ),
+            (
+                "IK_ONLY",
+                "IK Only",
+                "Skip FK baseline and solve from IK chains only",
+            ),
             (
                 "HYBRID",
                 "Hybrid FK + IK",

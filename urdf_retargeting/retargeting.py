@@ -56,6 +56,33 @@ _AXIS_VECTORS = {
 }
 
 
+def _get_retargeting_mode(settings) -> str:
+    """Return normalized retargeting mode with legacy value compatibility."""
+    raw_mode = settings.get("retargeting_method", None)
+    if raw_mode is None:
+        return "HYBRID"
+
+    mode_str = str(raw_mode)
+    legacy_map = {
+        "0": "FK_ONLY",
+        "1": "IK_ONLY",
+        "2": "HYBRID",
+    }
+    normalized = legacy_map.get(mode_str, mode_str)
+
+    if normalized not in {"FK_ONLY", "IK_ONLY", "HYBRID"}:
+        normalized = "HYBRID"
+
+    # Persist migration so Blender no longer keeps legacy enum identifiers.
+    if mode_str != normalized:
+        try:
+            settings["retargeting_method"] = normalized
+        except Exception:
+            pass
+
+    return normalized
+
+
 def _extract_yaw(matrix) -> float:
     """
     Extract yaw (rotation around world Z) from a 4×4 matrix.
@@ -223,6 +250,25 @@ def _compute_adaptive_step_limit(
     return base * scale
 
 
+def _compute_joint_path_length(
+    points: list[mathutils.Vector],
+    collapse_epsilon: float = 1e-6,
+) -> float:
+    """Sum distances between consecutive unique joint positions."""
+    if len(points) < 2:
+        return 0.0
+
+    total = 0.0
+    last_point = points[0]
+    for point in points[1:]:
+        step = (point - last_point).length
+        if step <= collapse_epsilon:
+            continue
+        total += step
+        last_point = point
+    return total
+
+
 def _short_cache_id(*parts: str) -> str:
     """Return a short deterministic IDProperty-safe key suffix."""
     payload = "|".join(parts).encode("utf-8", errors="ignore")
@@ -376,6 +422,52 @@ def _compute_custom_default_chain_reference(
             if pb.name in prev_bone_q:
                 pb.rotation_quaternion = prev_bone_q[pb.name]
         bpy.context.view_layer.update()
+
+
+def _ensure_joint_angles_initialized(
+    urdf_obj: bpy.types.Object,
+    scene: bpy.types.Scene,
+) -> None:
+    """
+    Ensure all revolute/continuous joints have initial angle values.
+
+    For IK-only mode, this guarantees that _joint_angle exists before
+    any FK or IK operations. Extracts angles from quaternion if needed.
+
+    Args:
+        urdf_obj: The URDF armature object.
+        scene: The Blender scene.
+    """
+    if scene.get("_joint_angles_initialized", False):
+        return
+
+    for pose_bone in urdf_obj.pose.bones:
+        jtype = get_bone_property(pose_bone, "joint_type", "revolute")
+        if jtype not in {"revolute", "continuous"}:
+            continue
+
+        # Check if _joint_angle already exists
+        if "_joint_angle" in pose_bone:
+            continue
+
+        # Try to use _last_urdf_angle as baseline
+        last_angle = get_bone_property(pose_bone, "_last_urdf_angle", None)
+        if last_angle is not None:
+            set_bone_property(pose_bone, "_joint_angle", last_angle)
+        else:
+            # Extract angle from current quaternion rotation
+            q = pose_bone.rotation_quaternion
+            # For a single-axis rotation around Y (standard hinge)
+            axis_name = get_bone_property(pose_bone, "axis", "Y")
+            axis = _AXIS_VECTORS.get(axis_name, _AXIS_VECTORS["Y"])
+
+            # Extract twist angle around the joint axis
+            extracted_angle = extract_twist_angle(q, axis)
+
+            set_bone_property(pose_bone, "_joint_angle", extracted_angle)
+            set_bone_property(pose_bone, "_last_urdf_angle", extracted_angle)
+
+    scene["_joint_angles_initialized"] = True
 
 
 def _apply_hinge_direction_constraint(
@@ -599,8 +691,10 @@ def apply_kinematic_retargeting(
     total_iters = 0.0
     total_residual = 0.0
     solved_chains = 0
-
-    bvh_root_mat = bvh_obj.matrix_world @ bvh_obj.pose.bones[0].matrix
+    prop_scale_min = float("inf")
+    prop_scale_max = float("-inf")
+    motion_delta_z_max = 0.0
+    retarget_mode = _get_retargeting_mode(settings)
 
     for chain in settings.kinematic_chains:
         if not chain.bvh_target_bone_name or not chain.urdf_end_bone_name:
@@ -629,6 +723,17 @@ def apply_kinematic_retargeting(
 
         end_bone = full_chain[-1]
         bvh_target_world = _get_pose_bone_world_position(bvh_obj, bvh_target_bone)
+
+        # Per-chain BVH root matrix: use the configured bvh_root_bone_name if set,
+        # falling back to the first pose bone (typically the hip/root in BVH imports).
+        bvh_chain_root_name = str(getattr(chain, "bvh_root_bone_name", "")).strip()
+        bvh_root_bone = (
+            bvh_obj.pose.bones.get(bvh_chain_root_name)
+            if bvh_chain_root_name
+            else None
+        ) or bvh_obj.pose.bones[0]
+        bvh_root_mat = bvh_obj.matrix_world @ bvh_root_bone.matrix
+
         target_local = bvh_root_mat.inverted() @ bvh_target_world
         end_world_now = _get_pose_bone_world_position(urdf_obj, end_bone)
         end_local_now = urdf_obj.matrix_world.inverted() @ end_world_now
@@ -636,6 +741,7 @@ def apply_kinematic_retargeting(
         chain_key = _short_cache_id(
             bvh_obj.name,
             chain.bvh_target_bone_name,
+            getattr(chain, "bvh_root_bone_name", ""),
             chain.urdf_root_bone_name,
             chain.urdf_end_bone_name,
         )
@@ -643,30 +749,123 @@ def apply_kinematic_retargeting(
         ref_bvh_key = f"ik_r_b_{chain_key}"
 
         if ref_urdf_key not in target_cache:
+            # Always use neutral pose reference, not current end-effector position
             custom_ref = _compute_custom_default_end_local(
                 urdf_obj,
                 settings,
                 chain.urdf_end_bone_name,
             )
-            target_cache[ref_urdf_key] = (
-                custom_ref.copy() if custom_ref is not None else end_local_now.copy()
-            )
+            if custom_ref is not None:
+                target_cache[ref_urdf_key] = custom_ref.copy()
+            else:
+                # Fallback: use current position
+                target_cache[ref_urdf_key] = end_local_now.copy()
         if ref_bvh_key not in target_cache:
             target_cache[ref_bvh_key] = target_local.copy()
 
         ref_urdf_local = mathutils.Vector(target_cache[ref_urdf_key])
         ref_bvh_local = mathutils.Vector(target_cache[ref_bvh_key])
 
-        # Absolute target with calibration offset keeps frame-0 alignment.
-        calibration_offset = ref_urdf_local - ref_bvh_local
-        absolute_target = target_local + calibration_offset
+        # Build/cached neutral chain reference before proportional scaling.
+        ref_chain_key = f"ik_r_chain_{chain_key}"
+        if ref_chain_key not in target_cache:
+            ref_data = _compute_custom_default_chain_reference(
+                urdf_obj,
+                settings,
+                solver_bones,
+                end_bone,
+            )
+            if ref_data is not None:
+                target_cache[ref_chain_key] = ref_data
+        ref_data = target_cache.get(ref_chain_key, None)
+
+        # Compute proportion scale from complete chain profile (not just end-effector radius).
+        # This improves arm reach and prevents unnatural stretching/shortening.
+        bvh_chain_length = 0.0
+        urdf_chain_length = 0.0
+
+        # URDF chain length must follow the neutral motor-to-motor path, not the
+        # imported bone display lengths. Consecutive co-located motors are collapsed
+        # so multi-axis joints at the same pivot do not distort the chain length.
+        urdf_chain_length_key = f"ik_urdf_chain_len_{chain_key}"
+        if urdf_chain_length_key not in target_cache:
+            if ref_data is not None and "points_local" in ref_data:
+                urdf_chain_points = [
+                    mathutils.Vector(v) for v in ref_data["points_local"]
+                ]
+            else:
+                urdf_chain_points = [
+                    pb.matrix.to_translation().copy() for pb in solver_bones
+                ]
+                urdf_chain_points.append(end_bone.matrix.to_translation().copy())
+            target_cache[urdf_chain_length_key] = _compute_joint_path_length(
+                urdf_chain_points
+            )
+        urdf_chain_length = float(target_cache[urdf_chain_length_key])
+
+        # BVH chain length: sum REST-pose bone lengths walking up the ancestor chain.
+        # Using rest-pose (bone.bone.length) avoids pose-dependent distance inflation
+        # that would corrupt proportion_scale when cached on a dynamic animation frame.
+        bvh_chain_length_key = f"ik_bvh_chain_len_{chain_key}"
+        if bvh_chain_length_key not in target_cache:
+            bvh_segment_lengths = []
+            current_bvh = bvh_target_bone
+            wanted_bvh_root = str(getattr(chain, "bvh_root_bone_name", "")).strip()
+            reached_wanted_root = False
+            ancestor_depth = 0
+            max_ancestor_depth = max(2, len(solver_bones) + 2)
+            while ancestor_depth < max_ancestor_depth:
+                # Use rest-pose bone length (pose-independent).
+                rest_len = getattr(current_bvh.bone, "length", 0.0)
+                bvh_segment_lengths.insert(0, max(rest_len, 1e-9))
+
+                if wanted_bvh_root and current_bvh.name == wanted_bvh_root:
+                    reached_wanted_root = True
+                    break
+
+                if not current_bvh.parent:
+                    break
+
+                current_bvh = current_bvh.parent
+                ancestor_depth += 1
+
+            # If an explicit BVH root was configured but not reached, force fallback.
+            if wanted_bvh_root and not reached_wanted_root:
+                bvh_chain_length = 0.0
+            else:
+                bvh_chain_length = sum(bvh_segment_lengths)
+            target_cache[bvh_chain_length_key] = bvh_chain_length
+        else:
+            bvh_chain_length = target_cache[bvh_chain_length_key]
+
+        # Proportion scale: URDF total chain length / BVH total chain length
+        # Provides better skeletal proportion compensation across different rigs
+        if bvh_chain_length > 1e-6 and urdf_chain_length > 1e-6:
+            proportion_scale = urdf_chain_length / bvh_chain_length
+        else:
+            # Fallback to end-effector distance ratioing
+            bvh_ref_radius = max(ref_bvh_local.length, 1e-6)
+            urdf_ref_radius = ref_urdf_local.length
+            proportion_scale = urdf_ref_radius / bvh_ref_radius
+
+        prop_scale_min = min(prop_scale_min, proportion_scale)
+        prop_scale_max = max(prop_scale_max, proportion_scale)
+
+        # Convert BVH root-space motion delta into URDF armature-local space.
+        # target_local/ref_bvh_local live in BVH root-bone space, while ref_urdf_local
+        # lives in URDF armature space. Mixing them directly breaks motion direction
+        # whenever BVH root orientation differs from the URDF object orientation.
+        bvh_motion_delta = target_local - ref_bvh_local
+        bvh_motion_world = bvh_root_mat.to_3x3() @ bvh_motion_delta
+        urdf_motion_delta = urdf_obj.matrix_world.to_3x3().inverted() @ bvh_motion_world
+        motion_delta_z_max = max(motion_delta_z_max, abs(urdf_motion_delta.z))
+
+        # Absolute target keeps the neutral/reference frame aligned.
+        absolute_target = ref_urdf_local + urdf_motion_delta
 
         # Proportion-scaled motion target transfers BVH motion with chain-size compensation.
-        bvh_ref_radius = max(ref_bvh_local.length, 1e-6)
-        urdf_ref_radius = ref_urdf_local.length
-        proportion_scale = urdf_ref_radius / bvh_ref_radius
         scaled_motion_target = ref_urdf_local + (
-            (target_local - ref_bvh_local) * proportion_scale * settings.ik_target_scale
+            urdf_motion_delta * proportion_scale * settings.ik_target_scale
         )
 
         # Blend both strategies for robust behavior across very different body proportions.
@@ -703,18 +902,23 @@ def apply_kinematic_retargeting(
         target_world = urdf_obj.matrix_world @ desired_local
 
         # Clamp target distance to reachable chain length to avoid solver instability.
+        # Use neutral-pose segment lengths (true motor-to-motor distances) as the
+        # maximum extension, NOT bone display lengths which are nominal motor sizes.
         chain_root_world = _get_pose_bone_world_position(urdf_obj, full_chain[0])
         chain_reach_key = f"ik_reach_{chain_key}"
         if chain_reach_key in target_cache:
             chain_reach = float(target_cache[chain_reach_key])
         else:
-            chain_reach = sum(max(0.0, b.bone.length) for b in full_chain)
-            if chain_reach <= 1e-9:
+            if ref_data is not None and "segment_lengths" in ref_data:
+                chain_reach = sum(max(0.0, float(s)) for s in ref_data["segment_lengths"])
+            else:
                 chain_reach = 0.0
                 for i in range(1, len(full_chain)):
                     a = _get_pose_bone_world_position(urdf_obj, full_chain[i - 1])
                     b = _get_pose_bone_world_position(urdf_obj, full_chain[i])
                     chain_reach += (b - a).length
+            if chain_reach <= 1e-9:
+                chain_reach = 0.0
             target_cache[chain_reach_key] = chain_reach
 
         to_target = target_world - chain_root_world
@@ -748,38 +952,47 @@ def apply_kinematic_retargeting(
         }
         desired_end_world_q = None
         orient_weight = 0.0
-        if is_foot_chain:
-            # Track end-effector orientation in IK for feet so direction matching
-            # happens in the solver instead of a strong post-process correction.
-            bvh_target_world_q = (
-                bvh_obj.matrix_world @ bvh_target_bone.matrix
-            ).to_quaternion()
-            ref_orient_key = f"ik_r_q_{chain_key}"
-            if ref_orient_key not in target_cache:
-                end_world_q = (urdf_obj.matrix_world @ end_bone.matrix).to_quaternion()
-                ref_orient_q = end_world_q @ bvh_target_world_q.inverted()
-                target_cache[ref_orient_key] = (
-                    ref_orient_q.w,
-                    ref_orient_q.x,
-                    ref_orient_q.y,
-                    ref_orient_q.z,
-                )
 
-            ref_orient_q = mathutils.Quaternion(target_cache[ref_orient_key])
-            desired_end_world_q = ref_orient_q @ bvh_target_world_q
+        # Apply orientation targeting to ALL chains (not just feet).
+        # Use per-chain orientation_weight if available, fall back to global setting.
+        bvh_target_world_q = (
+            bvh_obj.matrix_world @ bvh_target_bone.matrix
+        ).to_quaternion()
+        ref_orient_key = f"ik_r_q_{chain_key}"
+        if ref_orient_key not in target_cache:
+            # Reference orientation is the delta from neutral URDF pose to BVH
+            end_world_q = (urdf_obj.matrix_world @ end_bone.matrix).to_quaternion()
+            ref_orient_q = end_world_q @ bvh_target_world_q.inverted()
+            target_cache[ref_orient_key] = (
+                ref_orient_q.w,
+                ref_orient_q.x,
+                ref_orient_q.y,
+                ref_orient_q.z,
+            )
+
+        ref_orient_q = mathutils.Quaternion(target_cache[ref_orient_key])
+        desired_end_world_q = ref_orient_q @ bvh_target_world_q
+
+        # Get orientation weight: per-chain override > global foot weight > default
+        per_chain_weight = getattr(chain, "orientation_weight", None)
+        if per_chain_weight is not None:
+            orient_weight = clamp_to_limits(per_chain_weight, 0.0, 1.0)
+        elif is_foot_chain:
+            # Legacy support for global foot-specific weight
             orient_weight = clamp_to_limits(
-                getattr(settings, "ik_foot_orientation_weight", 0.35),
+                getattr(settings, "ik_foot_orientation_weight", 0.55),
                 0.0,
                 1.0,
             )
+        else:
+            # Non-foot chains: use default per-chain weight
+            orient_weight = clamp_to_limits(0.55, 0.0, 1.0)
 
         # Hybrid mode can adapt IK strength by current target error:
         # keep FK-dominant behavior for tiny residuals and progressively
         # increase IK influence when end-effector error grows.
         chain_blend = correction_blend
-        if settings.retargeting_method == "HYBRID" and getattr(
-            settings, "hybrid_adaptive_ik", False
-        ):
+        if retarget_mode == "HYBRID" and getattr(settings, "hybrid_adaptive_ik", False):
             use_chain_override = getattr(chain, "use_hybrid_adaptive_override", False)
             if use_chain_override:
                 low = max(1e-6, chain.hybrid_error_low)
@@ -806,23 +1019,11 @@ def apply_kinematic_retargeting(
             if max_iterations_override is not None
             else int(settings.ik_iterations)
         )
-        if settings.retargeting_method == "HYBRID":
+        if retarget_mode == "HYBRID":
             blend_factor = clamp_to_limits(chain_blend, 0.15, 1.0)
             max_iterations = int(round(max_iterations * blend_factor))
         max_iterations = max(1, max_iterations)
 
-        ref_chain_key = f"ik_r_chain_{chain_key}"
-        if ref_chain_key not in target_cache:
-            ref_data = _compute_custom_default_chain_reference(
-                urdf_obj,
-                settings,
-                solver_bones,
-                end_bone,
-            )
-            if ref_data is not None:
-                target_cache[ref_chain_key] = ref_data
-
-        ref_data = target_cache.get(ref_chain_key, None)
         if ref_data is None:
             # Fallback: keep current state if neutral reference cannot be built.
             initial_points_world = _collect_chain_points_world(
@@ -938,10 +1139,16 @@ def apply_kinematic_retargeting(
         scene["_ik_fabrik_avg_iters"] = total_iters / float(solved_chains)
         scene["_ik_fabrik_avg_residual"] = total_residual / float(solved_chains)
         scene["_ik_fabrik_chains"] = solved_chains
+        scene["_ik_proportion_scale_min"] = prop_scale_min
+        scene["_ik_proportion_scale_max"] = prop_scale_max
+        scene["_ik_motion_delta_z_max"] = motion_delta_z_max
     else:
         scene["_ik_fabrik_avg_iters"] = 0.0
         scene["_ik_fabrik_avg_residual"] = 0.0
         scene["_ik_fabrik_chains"] = 0
+        scene["_ik_proportion_scale_min"] = 0.0
+        scene["_ik_proportion_scale_max"] = 0.0
+        scene["_ik_motion_delta_z_max"] = 0.0
 
 
 def get_lowest_z_world(urdf_obj: bpy.types.Object) -> float:
@@ -1120,7 +1327,11 @@ def _apply_output_post_processing(
         smooth_cache[vel_key] = raw_angle
 
         # EMA smoothing
-        last_angle = get_bone_property(pose_bone, "_last_urdf_angle", raw_angle)
+        # Get previous angle; if missing (IK-only initialization), use current as baseline
+        last_angle = get_bone_property(pose_bone, "_last_urdf_angle", None)
+        if last_angle is None:
+            # First frame or IK-only mode: no prior state, use current as baseline
+            last_angle = raw_angle
         final_angle = apply_exponential_smoothing(
             raw_angle, last_angle, settings.joint_smoothing
         )
@@ -1448,10 +1659,33 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     scene["_ik_solver_pin_pos"] = solver_pin_pos
 
     # ------------------------------------------------------------------
+    # 3b. Flush urdf.matrix_world so IK world-space computations are correct.
+    # Root location + rotation were set in steps 1-2.  Without this update,
+    # urdf_obj.matrix_world is stale (previous frame) for all IK chain
+    # position queries, causing systematic target offset — especially severe
+    # in IK-only mode where there is no FK warm-start to absorb the error.
+    # ------------------------------------------------------------------
+    bpy.context.view_layer.update()
+
+    retarget_mode = _get_retargeting_mode(settings)
+    ik_only_active = bool(settings.ik_only_mode or retarget_mode == "IK_ONLY")
+    fk_only_active = retarget_mode == "FK_ONLY"
+    previous_retarget_mode = str(scene.get("_last_retarget_mode", ""))
+    if previous_retarget_mode != retarget_mode:
+        scene["_joint_angles_initialized"] = False
+    scene["_last_retarget_mode"] = retarget_mode
+
+    # ------------------------------------------------------------------
+    # 3c. Initialize joint angles for IK-only mode and continuity
+    # ------------------------------------------------------------------
+    _ensure_joint_angles_initialized(urdf, scene)
+
+    # ------------------------------------------------------------------
     # 4. Joint retargeting (FK baseline + IK correction)
     # ------------------------------------------------------------------
+
     t_fk_start = time.perf_counter()
-    if not settings.ik_only_mode:
+    if not ik_only_active:
         for item in settings.mappings:
             apply_joint_retargeting(urdf, bvh, item, smooth_cache, settings, scene)
     scene["_retarget_ms_fk"] = (time.perf_counter() - t_fk_start) * 1000.0
@@ -1459,8 +1693,10 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
     export_full_quality = bool(scene.get("_export_full_quality", False))
 
     ik_blend = clamp_to_limits(settings.hybrid_ik_blend, 0.0, 1.0)
-    if settings.ik_only_mode:
+    if ik_only_active:
         ik_blend = 1.0
+    elif fk_only_active:
+        ik_blend = 0.0
 
     if ik_blend <= 1e-6:
         scene["_retarget_ms_ik"] = 0.0
@@ -1469,7 +1705,8 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
         if (
             settings.hybrid_realtime_guard
             and not export_full_quality
-            and not settings.ik_only_mode
+            and not ik_only_active
+            and not fk_only_active
         ):
             avg_ms = scene.get("_retarget_ms_ema", None)
             fps = scene.render.fps if scene.render.fps > 0 else 60.0
@@ -1720,6 +1957,15 @@ def retarget_frame(scene: bpy.types.Scene) -> None:
         scene["_stability_dbg_yaw_step"] = float(dbg_yaw_step_abs)
         scene["_stability_dbg_xy_drift"] = float(dbg_xy_drift_abs)
         scene["_stability_dbg_xy_step"] = float(dbg_xy_step_abs)
+
+        # IK-specific metrics
+        avg_iters = scene.get("_ik_fabrik_avg_iters", 0.0)
+        avg_residual = scene.get("_ik_fabrik_avg_residual", 0.0)
+        chains_solved = scene.get("_ik_fabrik_chains", 0)
+
+        scene["_ik_debug_iterations"] = float(avg_iters)
+        scene["_ik_debug_residual"] = float(avg_residual)
+        scene["_ik_debug_chains_count"] = int(chains_solved)
     else:
         for key in (
             "_stability_dbg_anchor_switch",
