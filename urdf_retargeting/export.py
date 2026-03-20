@@ -305,14 +305,10 @@ class OT_ExportBeyondMimic(Operator):
         self._data_rows = []
         self._meta_joints = {}
         self._orig_frame = scene.frame_current
-        self._orig_ik_iterations = int(getattr(settings, "ik_iterations", 12))
+        self._orig_ik_iterations = int(getattr(settings, "solver_iterations", 12))
         self._phase = 1
 
-        # Export should always evaluate the full-quality retarget path.
-        scene["_export_full_quality"] = True
-        settings.ik_iterations = int(
-            getattr(settings, "quality_ik_iterations", self._orig_ik_iterations)
-        )
+        # Export uses the same live solver settings that are active in the viewport.
 
         # Start modal loop — progress tracks frame evaluation
         wm = context.window_manager
@@ -587,14 +583,15 @@ class OT_ExportBeyondMimic(Operator):
                         "total_samples": len(self._data_rows),
                         # Export Settings
                         "bvh_smoothing": settings.bvh_smoothing,
-                        "joint_smoothing": settings.joint_smoothing,
+                        "output_joint_smoothing": settings.output_joint_smoothing,
                         "retarget_quality": {
-                            "mode": "full_quality",
+                            "mode": "live_settings",
                             "ik_solver": "fabrik_c",
-                            "hybrid_ik_blend": settings.hybrid_ik_blend,
-                            "realtime_guard_ui_enabled": settings.hybrid_realtime_guard,
-                            "realtime_guard_applied_during_export": False,
-                            "note": "Export forces full IK quality; realtime guard throttling is ignored during frame evaluation.",
+                            "hybrid_master_blend": settings.hybrid_master_blend,
+                            "solver_iterations": settings.solver_iterations,
+                            "solver_tolerance": settings.solver_tolerance,
+                            "solver_step_limit": settings.solver_step_limit,
+                            "note": "Export uses the same live retargeting settings that are active in the viewport.",
                         },
                         # Units
                         "measurement_unit": "meters",
@@ -646,9 +643,7 @@ class OT_ExportBeyondMimic(Operator):
     def cleanup(self, context):
         """Clean up modal state and restore scene."""
         settings = context.scene.bvh_mapping_settings
-        if "_export_full_quality" in context.scene:
-            del context.scene["_export_full_quality"]
-        settings.ik_iterations = self._orig_ik_iterations
+        settings.solver_iterations = self._orig_ik_iterations
         context.scene.frame_set(self._orig_frame)
         context.window_manager.event_timer_remove(self._timer)
         context.window_manager.progress_end()

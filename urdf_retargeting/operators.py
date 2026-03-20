@@ -186,14 +186,7 @@ class OT_ApplyBVHMapping(Operator):
         baked_action = bpy.data.actions.new(name=action_name)
         urdf_obj.animation_data.action = baked_action
 
-        previous_quality_flag = scene.get("_export_full_quality", None)
-        previous_ik_iterations = int(getattr(settings, "ik_iterations", 12))
-        offline_ik_iterations = int(
-            getattr(settings, "quality_ik_iterations", previous_ik_iterations)
-        )
-
-        scene["_export_full_quality"] = True
-        settings.ik_iterations = offline_ik_iterations
+        previous_ik_iterations = int(getattr(settings, "solver_iterations", 12))
 
         total_eval_frames = max(0, eval_end - eval_start + 1)
         wm = context.window_manager
@@ -231,17 +224,11 @@ class OT_ApplyBVHMapping(Operator):
                 keyed_frames += 1
                 keyed_bones = len(urdf_obj.pose.bones)
         finally:
-            settings.ik_iterations = previous_ik_iterations
+            settings.solver_iterations = previous_ik_iterations
             wm.progress_end()
             context.workspace.status_text_set(None)
 
         self._set_action_linear_interpolation(baked_action)
-
-        if previous_quality_flag is None:
-            if "_export_full_quality" in scene:
-                del scene["_export_full_quality"]
-        else:
-            scene["_export_full_quality"] = previous_quality_flag
 
         if settings.precompute_disable_live_after_apply:
             settings.live_retarget = False
@@ -393,6 +380,12 @@ class OT_ApplyBVHMapping(Operator):
         if not self._validate_required_fields(settings, bvh_obj):
             return {"CANCELLED"}
 
+        if str(getattr(settings, "retargeting_method", "HYBRID")) == "IK_ONLY":
+            self.report(
+                {"WARNING"},
+                "IK Only (Debug) is active. Hybrid remains the intended production retargeting path.",
+            )
+
         # Disable retargeting during setup
         scene.bvh_mapping_settings.live_retarget = False
         scene.frame_set(0)
@@ -402,6 +395,8 @@ class OT_ApplyBVHMapping(Operator):
             "_persistent_foot_correction",
             "_persistent_foot_rot_correction",
             "_active_anchor_name",
+            "_anchor_candidate_name",
+            "_anchor_candidate_frames",
             "_anchor_world_pos_xy",
             "_anchor_world_pos",
             "_anchor_world_yaw",
@@ -604,19 +599,13 @@ class OT_BakeRetargetedMotion(Operator):
         scene = self._scene
 
         if settings is not None:
-            settings.ik_iterations = self._previous_ik_iterations
+            settings.solver_iterations = self._previous_ik_iterations
             if cancelled:
                 settings.live_retarget = self._disable_live_before
             elif settings.precompute_disable_live_after_apply:
                 settings.live_retarget = False
 
         if scene is not None:
-            if self._previous_quality_flag is None:
-                if "_export_full_quality" in scene:
-                    del scene["_export_full_quality"]
-            else:
-                scene["_export_full_quality"] = self._previous_quality_flag
-
             if "_bake_apply_request" in scene:
                 del scene["_bake_apply_request"]
 
@@ -756,12 +745,7 @@ class OT_BakeRetargetedMotion(Operator):
         self._baked_action = bpy.data.actions.new(name=f"{urdf_obj.name}_RetargetBake")
         urdf_obj.animation_data.action = self._baked_action
 
-        self._previous_quality_flag = scene.get("_export_full_quality", None)
-        self._previous_ik_iterations = int(getattr(settings, "ik_iterations", 12))
-        scene["_export_full_quality"] = True
-        settings.ik_iterations = int(
-            getattr(settings, "quality_ik_iterations", self._previous_ik_iterations)
-        )
+        self._previous_ik_iterations = int(getattr(settings, "solver_iterations", 12))
 
         total_eval_frames = max(1, self._eval_end - scene.frame_start + 1)
         wm = context.window_manager

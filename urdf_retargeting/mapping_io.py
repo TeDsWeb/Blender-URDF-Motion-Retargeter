@@ -5,26 +5,55 @@ import os
 import re
 
 
+PRESET_SCHEMA_VERSION = 3
+PRESET_FORMAT = "urdf_retargeting_mapping_v3"
+
+_SETTINGS_ALIASES = {
+    "joint_smoothing": "output_joint_smoothing",
+    "ik_iterations": "solver_iterations",
+    "quality_ik_iterations": "solver_iterations",
+    "ik_tolerance": "solver_tolerance",
+    "ik_max_step_angle": "solver_step_limit",
+    "ik_target_scale": "solver_target_scale",
+    "ik_proportion_blend": "solver_proportion_blend",
+    "ik_ground_lock_strength": "solver_ground_lock_strength",
+    "ik_target_smoothing": "solver_target_smoothing",
+    "hybrid_ik_blend": "hybrid_master_blend",
+    "hybrid_adaptive_ik": "hybrid_auto_blend",
+    "hybrid_min_ik_blend": "hybrid_blend_min",
+    "hybrid_error_low": "hybrid_blend_error_low",
+    "hybrid_error_high": "hybrid_blend_error_high",
+}
+
+_CHAIN_ALIASES = {
+    "use_hybrid_adaptive_override": "use_auto_blend_override",
+    "hybrid_min_ik_blend": "auto_blend_min",
+    "hybrid_error_low": "auto_blend_error_low",
+    "hybrid_error_high": "auto_blend_error_high",
+    "orientation_weight": "solver_orientation_weight",
+}
+
+
 PRESET_SETTING_FIELDS = [
     "retargeting_method",
     "bvh_smoothing",
-    "joint_smoothing",
+    "output_joint_smoothing",
+    "output_smoothing_policy",
+    "ik_output_smoothing_min",
     "ik_only_mode",
     "max_jump_threshold",
-    "ik_iterations",
-    "ik_tolerance",
-    "ik_max_step_angle",
-    "ik_target_scale",
-    "ik_proportion_blend",
-    "ik_ground_lock_strength",
-    "ik_target_smoothing",
-    "hybrid_ik_blend",
-    "hybrid_adaptive_ik",
-    "hybrid_min_ik_blend",
-    "hybrid_error_low",
-    "hybrid_error_high",
-    "hybrid_realtime_guard",
-    "hybrid_min_iterations",
+    "solver_iterations",
+    "solver_tolerance",
+    "solver_step_limit",
+    "solver_target_scale",
+    "solver_proportion_blend",
+    "solver_ground_lock_strength",
+    "solver_target_smoothing",
+    "hybrid_master_blend",
+    "hybrid_auto_blend",
+    "hybrid_blend_min",
+    "hybrid_blend_error_low",
+    "hybrid_blend_error_high",
     "foot_l_name",
     "foot_r_name",
     "jump_threshold",
@@ -50,6 +79,32 @@ PRESET_SETTING_FIELDS = [
     "mapping_mocap_profile",
     "stability_debug_metrics",
 ]
+
+
+def _migrate_settings_dict(settings_data: dict) -> dict:
+    """Normalize settings keys from legacy/new aliases to canonical property names."""
+    migrated = {}
+    for key, value in settings_data.items():
+        canonical = _SETTINGS_ALIASES.get(key, key)
+        migrated[canonical] = value
+
+    if "retargeting_method" in migrated:
+        migrated["retargeting_method"] = {
+            "0": "FK_ONLY",
+            "1": "IK_ONLY",
+            "2": "HYBRID",
+        }.get(str(migrated["retargeting_method"]), migrated["retargeting_method"])
+
+    return migrated
+
+
+def _migrate_chain_dict(chain_data: dict) -> dict:
+    """Normalize chain keys from legacy/new aliases to canonical property names."""
+    migrated = {}
+    for key, value in chain_data.items():
+        canonical = _CHAIN_ALIASES.get(key, key)
+        migrated[canonical] = value
+    return migrated
 
 
 def _to_json_value(value):
@@ -87,7 +142,8 @@ def sanitize_preset_filename(name):
 def export_mapping_to_json(filepath, settings, metadata=None):
     """Write mapping + kinematic chain configuration to JSON."""
     data = {
-        "format": "urdf_retargeting_mapping_v2",
+        "format": PRESET_FORMAT,
+        "schema_version": PRESET_SCHEMA_VERSION,
         "metadata": metadata or {},
         "settings": {},
         "mappings": [],
@@ -128,10 +184,11 @@ def export_mapping_to_json(filepath, settings, metadata=None):
                 "urdf_root_bone_name": chain.urdf_root_bone_name,
                 "urdf_end_bone_name": chain.urdf_end_bone_name,
                 "influence": chain.influence,
-                "use_hybrid_adaptive_override": chain.use_hybrid_adaptive_override,
-                "hybrid_min_ik_blend": chain.hybrid_min_ik_blend,
-                "hybrid_error_low": chain.hybrid_error_low,
-                "hybrid_error_high": chain.hybrid_error_high,
+                "use_auto_blend_override": chain.use_auto_blend_override,
+                "auto_blend_min": chain.auto_blend_min,
+                "auto_blend_error_low": chain.auto_blend_error_low,
+                "auto_blend_error_high": chain.auto_blend_error_high,
+                "solver_orientation_weight": chain.solver_orientation_weight,
             }
         )
 
@@ -156,16 +213,11 @@ def import_mapping_from_json(filepath, settings):
     with open(filepath, "r", encoding="utf-8") as handle:
         data = json.load(handle)
 
-    for key, value in data.get("settings", {}).items():
+    migrated_settings = _migrate_settings_dict(data.get("settings", {}))
+    for key, value in migrated_settings.items():
         if not hasattr(settings, key):
             continue
         try:
-            if key == "retargeting_method":
-                value = {
-                    "0": "FK_ONLY",
-                    "1": "IK_ONLY",
-                    "2": "HYBRID",
-                }.get(str(value), value)
             current_value = getattr(settings, key)
             if isinstance(value, list) and not isinstance(current_value, str):
                 setattr(settings, key, tuple(value))
@@ -197,19 +249,25 @@ def import_mapping_from_json(filepath, settings):
 
     settings.kinematic_chains.clear()
     for c in data.get("kinematic_chains", []):
+        chain_data = _migrate_chain_dict(c)
         chain = settings.kinematic_chains.add()
-        chain.label = c.get("label", "")
-        chain.bvh_target_bone_name = c.get("bvh_target_bone_name", "")
-        chain.bvh_root_bone_name = c.get("bvh_root_bone_name", "")
-        chain.urdf_root_bone_name = c.get("urdf_root_bone_name", "")
-        chain.urdf_end_bone_name = c.get("urdf_end_bone_name", "")
-        chain.influence = float(c.get("influence", 1.0))
-        chain.use_hybrid_adaptive_override = bool(
-            c.get("use_hybrid_adaptive_override", False)
+        chain.label = chain_data.get("label", "")
+        chain.bvh_target_bone_name = chain_data.get("bvh_target_bone_name", "")
+        chain.bvh_root_bone_name = chain_data.get("bvh_root_bone_name", "")
+        chain.urdf_root_bone_name = chain_data.get("urdf_root_bone_name", "")
+        chain.urdf_end_bone_name = chain_data.get("urdf_end_bone_name", "")
+        chain.influence = float(chain_data.get("influence", 1.0))
+        chain.use_auto_blend_override = bool(
+            chain_data.get("use_auto_blend_override", False)
         )
-        chain.hybrid_min_ik_blend = float(c.get("hybrid_min_ik_blend", 0.2))
-        chain.hybrid_error_low = float(c.get("hybrid_error_low", 0.01))
-        chain.hybrid_error_high = float(c.get("hybrid_error_high", 0.08))
+        chain.auto_blend_min = float(chain_data.get("auto_blend_min", 0.2))
+        chain.auto_blend_error_low = float(chain_data.get("auto_blend_error_low", 0.01))
+        chain.auto_blend_error_high = float(
+            chain_data.get("auto_blend_error_high", 0.08)
+        )
+        chain.solver_orientation_weight = float(
+            chain_data.get("solver_orientation_weight", 0.55)
+        )
 
     settings.default_pose_joints.clear()
     for item in data.get("default_pose", {}).get("joints", []):

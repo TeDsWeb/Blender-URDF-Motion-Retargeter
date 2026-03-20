@@ -119,124 +119,202 @@ class PANEL_MotionOptions(Panel):
         """Draw motion options panel."""
         layout = self.layout
         settings = context.scene.bvh_mapping_settings
+        mode = str(getattr(settings, "retargeting_method", "HYBRID"))
 
-        layout.label(text="Retargeting: Hybrid FK + IK", icon="INFO")
+        header = layout.box()
+        header.label(text="Retargeting Method", icon="CON_ARMATURE")
+        header.prop(settings, "retargeting_method", text="")
+        header.label(
+            text="Hybrid is the production path. IK-only is for debug only.",
+            icon="INFO",
+        )
 
-        # Root motion control
-        box = layout.box()
-        box.label(text="Root Motion", icon="ARMATURE_DATA")
-        box.prop(settings, "root_scale", slider=True)
-        if _draw_advanced_toggle(box, settings, "ui_show_root_advanced"):
-            box.prop(settings, "location_offset")
-            box.prop(settings, "rotation_offset")
+        if settings.ik_only_mode and mode != "IK_ONLY":
+            warn = header.row()
+            warn.alert = True
+            warn.label(text="Legacy 'IK Only Mode' is enabled", icon="ERROR")
+            header.prop(settings, "ik_only_mode")
 
-        # BVH source smoothing (always visible)
-        box = layout.box()
-        box.label(text="Smoothing", icon="MOD_SMOOTH")
-        box.prop(settings, "bvh_smoothing", slider=True)
+        if mode == "IK_ONLY":
+            warn = header.row()
+            warn.alert = True
+            warn.label(
+                text="IK-only debug mode bypasses the normal hybrid baseline",
+                icon="ERROR",
+            )
 
-        # --- HYBRID: FK Baseline ---
-        fk_box = layout.box()
-        fk_box.label(text="FK Baseline", icon="BONE_DATA")
-        fk_box.prop(settings, "ik_only_mode")
-        fk_box.prop(settings, "joint_smoothing", slider=True)
-        if _draw_advanced_toggle(fk_box, settings, "ui_show_fk_advanced"):
-            fk_box.prop(settings, "max_jump_threshold", slider=True)
+        root_box = layout.box()
+        root_box.label(text="Root Motion", icon="ARMATURE_DATA")
+        root_box.prop(settings, "root_scale", slider=True)
+        if _draw_advanced_toggle(root_box, settings, "ui_show_root_advanced"):
+            row = root_box.row(align=True)
+            row.prop(settings, "location_offset", text="Pos Offset")
+            row.prop(settings, "rotation_offset", text="Rot Offset")
 
-        # --- HYBRID: IK Correction ---
-        ik_box = layout.box()
-        ik_box.label(text="IK Correction", icon="CON_KINEMATIC")
-        ik_box.label(text="Solver: FABRIK-C", icon="INFO")
-        ik_box.prop(settings, "hybrid_ik_blend", slider=True)
-        ik_box.prop(settings, "ik_target_smoothing", slider=True)
-        if _draw_advanced_toggle(ik_box, settings, "ui_show_ik_advanced"):
-            ik_box.prop(settings, "hybrid_adaptive_ik")
-            if settings.hybrid_adaptive_ik:
-                sub = ik_box.column(align=True)
-                sub.prop(settings, "hybrid_min_ik_blend", slider=True)
-                sub.prop(settings, "hybrid_error_low")
-                sub.prop(settings, "hybrid_error_high")
-            ik_box.separator()
-            ik_box.prop(settings, "ik_iterations")
-            ik_box.prop(settings, "ik_tolerance")
-            ik_box.prop(settings, "ik_max_step_angle", slider=True)
-            ik_box.prop(settings, "ik_target_scale", slider=True)
-            ik_box.prop(settings, "ik_proportion_blend", slider=True)
-            ik_box.prop(settings, "ik_ground_lock_strength", slider=True)
+        blend_box = layout.box()
+        blend_box.label(text="Retarget Blend", icon="MOD_SMOOTH")
+        blend_box.prop(settings, "bvh_smoothing", slider=True)
+        blend_box.prop(settings, "output_joint_smoothing", slider=True)
 
-        # --- HYBRID: Performance ---
+        if mode == "FK_ONLY":
+            blend_box.label(
+                text="FK-only active: IK correction disabled", icon="BONE_DATA"
+            )
+        elif mode == "IK_ONLY":
+            blend_box.label(
+                text="IK-only active: FK baseline skipped", icon="CON_KINEMATIC"
+            )
+        else:
+            blend_row = blend_box.row(align=True)
+            blend_row.label(text="IK Influence")
+            blend_row.prop(settings, "hybrid_master_blend", text="", slider=True)
+
+        if _draw_advanced_toggle(
+            blend_box, settings, "ui_show_fk_advanced", label="Stability"
+        ):
+            blend_box.prop(settings, "max_jump_threshold", slider=True)
+            blend_box.prop(settings, "solver_target_smoothing", slider=True)
+            blend_box.prop(settings, "output_smoothing_policy")
+            if settings.output_smoothing_policy != "ALWAYS":
+                blend_box.prop(settings, "ik_output_smoothing_min", slider=True)
+
+        solver_box = layout.box()
+        solver_box.label(text="IK Solver (FABRIK-C)", icon="CON_KINEMATIC")
+        solver_box.prop(settings, "solver_iterations")
+        solver_box.prop(settings, "solver_tolerance")
+        if mode == "HYBRID":
+            solver_box.prop(settings, "hybrid_auto_blend")
+            if settings.hybrid_auto_blend:
+                err_row = solver_box.row(align=True)
+                err_row.prop(settings, "hybrid_blend_error_low", text="Error Low")
+                err_row.prop(settings, "hybrid_blend_error_high", text="Error High")
+
+        if _draw_advanced_toggle(solver_box, settings, "ui_show_ik_advanced"):
+            solver_box.prop(settings, "solver_step_limit", slider=True)
+            solver_box.prop(settings, "solver_target_scale", slider=True)
+            solver_box.prop(settings, "solver_proportion_blend", slider=True)
+            solver_box.prop(settings, "solver_ground_lock_strength", slider=True)
+
         perf_box = layout.box()
         perf_box.label(text="Performance", icon="SORTTIME")
-        perf_box.prop(settings, "hybrid_realtime_guard")
         if _draw_advanced_toggle(
             perf_box,
             settings,
             "ui_show_performance_advanced",
         ):
-            if settings.hybrid_realtime_guard:
-                perf_box.prop(settings, "hybrid_min_iterations")
-            perf_box.prop(settings, "quality_ik_iterations")
-            perf_box.prop(settings, "stability_debug_metrics")
-            perf_box.separator()
             perf_box.prop(settings, "bake_watchdog_enabled")
             if settings.bake_watchdog_enabled:
-                perf_box.prop(settings, "bake_watchdog_frame_ms")
-                perf_box.prop(settings, "bake_watchdog_abort")
+                row = perf_box.row(align=True)
+                row.prop(settings, "bake_watchdog_frame_ms")
+                row.prop(settings, "bake_watchdog_abort")
+            perf_box.prop(settings, "stability_debug_metrics")
 
-        # --- Telemetry ---
+        telemetry_box = layout.box()
+        telemetry_box.label(text="Telemetry", icon="TIME")
         avg_ms = context.scene.get("_retarget_ms_ema", None)
         if avg_ms is not None:
-            perf_box.separator()
-            perf_box.label(text=f"Retarget Avg: {avg_ms:.2f} ms/frame", icon="TIME")
+            telemetry_box.label(text=f"Total: {avg_ms:.2f} ms/frame")
+        fk_ms = context.scene.get("_retarget_ms_fk", None)
         ik_ms = context.scene.get("_retarget_ms_ik", None)
+        if fk_ms is not None:
+            telemetry_box.label(text=f"FK Stage: {fk_ms:.2f} ms", icon="BONE_DATA")
         if ik_ms is not None:
-            perf_box.label(text=f"IK Stage: {ik_ms:.2f} ms", icon="CON_KINEMATIC")
+            telemetry_box.label(text=f"IK Stage: {ik_ms:.2f} ms", icon="CON_KINEMATIC")
+
         fabrik_iters = context.scene.get("_ik_fabrik_avg_iters", None)
-        if fabrik_iters is not None:
-            perf_box.label(text=f"FABRIK Avg Iter: {fabrik_iters:.2f}", icon="DRIVER")
         fabrik_residual = context.scene.get("_ik_fabrik_avg_residual", None)
+        if fabrik_iters is not None:
+            telemetry_box.label(
+                text=f"FABRIK Avg Iter: {fabrik_iters:.2f}", icon="DRIVER"
+            )
         if fabrik_residual is not None:
-            perf_box.label(
+            telemetry_box.label(
                 text=f"FABRIK Residual: {fabrik_residual:.4f} m",
                 icon="TRACKING_REFINE_FORWARDS",
             )
-        ps_min = context.scene.get("_ik_proportion_scale_min", None)
-        ps_max = context.scene.get("_ik_proportion_scale_max", None)
-        if ps_min is not None and ps_max is not None and float(ps_max) > 0.0:
-            perf_box.label(
-                text=f"Proportion Scale: {float(ps_min):.3f} – {float(ps_max):.3f}",
-                icon="DRIVER_DISTANCE",
+        output_smoothing = context.scene.get("_rt_output_smoothing_effective", None)
+        smoothing_suppress = context.scene.get("_rt_output_smoothing_suppress", None)
+        if output_smoothing is not None:
+            telemetry_box.label(
+                text=f"Output Smoothing Eff: {float(output_smoothing):.3f}"
             )
-        dz_max = context.scene.get("_ik_motion_delta_z_max", None)
-        if dz_max is not None:
-            perf_box.label(
-                text=f"Motion Delta Z max: {float(dz_max):.4f} m",
-                icon="SORT_DESC",
+        if smoothing_suppress is not None:
+            telemetry_box.label(
+                text=f"Smoothing Suppress: {float(smoothing_suppress):.3f}"
             )
-        fk_ms = context.scene.get("_retarget_ms_fk", None)
-        if fk_ms is not None:
-            perf_box.label(text=f"FK Stage: {fk_ms:.2f} ms", icon="BONE_DATA")
-        sink_ms = context.scene.get("_retarget_ms_sink", None)
-        if sink_ms is not None:
-            perf_box.label(text=f"Anti-Sink: {sink_ms:.2f} ms", icon="EMPTY_ARROWS")
 
         if settings.stability_debug_metrics:
-            perf_box.separator()
+            telemetry_box.separator()
             yaw_res = context.scene.get("_stability_dbg_yaw_residual", None)
             if yaw_res is not None:
-                perf_box.label(text=f"Dbg Yaw Residual: {yaw_res:.4f} rad")
+                telemetry_box.label(text=f"Dbg Yaw Residual: {yaw_res:.4f} rad")
             yaw_step = context.scene.get("_stability_dbg_yaw_step", None)
             if yaw_step is not None:
-                perf_box.label(text=f"Dbg Yaw Step: {yaw_step:.4f} rad")
+                telemetry_box.label(text=f"Dbg Yaw Step: {yaw_step:.4f} rad")
             xy_drift = context.scene.get("_stability_dbg_xy_drift", None)
             if xy_drift is not None:
-                perf_box.label(text=f"Dbg XY Drift: {xy_drift:.4f} m")
+                telemetry_box.label(text=f"Dbg XY Drift: {xy_drift:.4f} m")
             xy_step = context.scene.get("_stability_dbg_xy_step", None)
             if xy_step is not None:
-                perf_box.label(text=f"Dbg XY Step: {xy_step:.4f} m")
+                telemetry_box.label(text=f"Dbg XY Step: {xy_step:.4f} m")
             anchor_switch = context.scene.get("_stability_dbg_anchor_switch", None)
             if anchor_switch is not None:
-                perf_box.label(text=f"Dbg Anchor Switch: {int(anchor_switch)}")
+                telemetry_box.label(text=f"Dbg Anchor Switch: {int(anchor_switch)}")
+
+
+class PANEL_IKInfluenceOverview(Panel):
+    """Compact summary panel for effective IK influence in hybrid mode."""
+
+    bl_label = "IK Influence Overview"
+    bl_idname = "VIEW3D_PT_urdf_ik_influence_overview"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "BVH -> URDF Retargeting"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        """Draw hybrid IK influence summary."""
+        layout = self.layout
+        settings = context.scene.bvh_mapping_settings
+        mode = str(getattr(settings, "retargeting_method", "HYBRID"))
+
+        if mode == "FK_ONLY":
+            layout.label(text="FK-only mode: IK influence is 0", icon="INFO")
+            return
+
+        global_blend = 1.0 if mode == "IK_ONLY" else float(settings.hybrid_master_blend)
+
+        box = layout.box()
+        box.label(
+            text=f"Global IK Influence: {global_blend * 100.0:.1f}%",
+            icon="CON_KINEMATIC",
+        )
+
+        if mode == "HYBRID":
+            box.prop(settings, "hybrid_master_blend", slider=True)
+            box.prop(settings, "hybrid_auto_blend")
+            if settings.hybrid_auto_blend:
+                row = box.row(align=True)
+                row.prop(settings, "hybrid_blend_error_low", text="Error Low")
+                row.prop(settings, "hybrid_blend_error_high", text="Error High")
+
+        if not settings.kinematic_chains:
+            layout.label(text="No kinematic chains configured", icon="INFO")
+            return
+
+        chain_box = layout.box()
+        chain_box.label(text="Per-Chain Weights", icon="BONE_DATA")
+        for idx, chain in enumerate(settings.kinematic_chains):
+            label = chain.label or chain.bvh_target_bone_name or f"Chain {idx + 1}"
+            row = chain_box.row(align=True)
+            row.label(text=label)
+            if mode == "FK_ONLY":
+                row.label(text="0.0%")
+            elif mode == "IK_ONLY":
+                row.label(text=f"{chain.influence * 100.0:.1f}%")
+            else:
+                effective = chain.influence * global_blend
+                row.label(text=f"{effective * 100.0:.1f}%")
 
 
 class PANEL_FootConfiguration(Panel):
@@ -382,6 +460,23 @@ class PANEL_KinematicChains(Panel):
         layout = self.layout
         scene = context.scene
         settings = scene.bvh_mapping_settings
+        mode = str(getattr(settings, "retargeting_method", "HYBRID"))
+        global_blend = 1.0 if mode == "IK_ONLY" else float(settings.hybrid_master_blend)
+
+        if settings.kinematic_chains:
+            summary = layout.box()
+            summary.label(text="Chain Influence Summary", icon="CON_KINEMATIC")
+            for idx, chain in enumerate(settings.kinematic_chains):
+                label = chain.label or chain.bvh_target_bone_name or f"Chain {idx + 1}"
+                row_sum = summary.row(align=True)
+                row_sum.label(text=label)
+                if mode == "FK_ONLY":
+                    row_sum.label(text="0.0%")
+                elif mode == "IK_ONLY":
+                    row_sum.label(text=f"{chain.influence * 100.0:.1f}%")
+                else:
+                    eff = chain.influence * global_blend
+                    row_sum.label(text=f"{eff * 100.0:.1f}%")
 
         row = layout.row()
         row.template_list(
@@ -440,13 +535,15 @@ class PANEL_KinematicChains(Panel):
                 box.prop(chain, "urdf_end_bone_name")
 
             box.prop(chain, "influence", slider=True)
+            box.prop(chain, "solver_orientation_weight", slider=True)
             box.separator()
-            box.label(text="Hybrid Adaptive Override", icon="CON_SPLINEIK")
-            box.prop(chain, "use_hybrid_adaptive_override")
-            if chain.use_hybrid_adaptive_override:
-                box.prop(chain, "hybrid_min_ik_blend", slider=True)
-                box.prop(chain, "hybrid_error_low")
-                box.prop(chain, "hybrid_error_high")
+            box.label(text="Adaptive Override", icon="CON_SPLINEIK")
+            box.prop(chain, "use_auto_blend_override", text="Use Chain Override")
+            if chain.use_auto_blend_override:
+                box.prop(chain, "auto_blend_min", slider=True)
+                row_err = box.row(align=True)
+                row_err.prop(chain, "auto_blend_error_low")
+                row_err.prop(chain, "auto_blend_error_high")
             layout.label(
                 text="Define chains from a URDF parent joint to an end-effector joint.",
                 icon="BONE_DATA",

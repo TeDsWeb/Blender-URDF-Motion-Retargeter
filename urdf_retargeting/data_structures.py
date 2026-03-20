@@ -119,35 +119,35 @@ class KinematicChainMapping(PropertyGroup):
         min=0.0,
         max=1.0,
     )
-    orientation_weight: FloatProperty(
-        name="Orientation Weight",
+    solver_orientation_weight: FloatProperty(
+        name="Solver Orientation Weight",
         description="How strongly the IK solver targets end-effector orientation (0=position only, 1=full orientation)",
         default=0.55,
         min=0.0,
         max=1.0,
     )
-    use_hybrid_adaptive_override: BoolProperty(
-        name="Adaptive Override",
+    use_auto_blend_override: BoolProperty(
+        name="Auto Blend Override",
         description="Use chain-specific adaptive Hybrid IK parameters",
         default=False,
     )
-    hybrid_min_ik_blend: FloatProperty(
-        name="Min IK",
+    auto_blend_min: FloatProperty(
+        name="Auto Blend Min",
         description="Chain-specific minimum IK blend in adaptive Hybrid mode",
         default=0.2,
         min=0.0,
         max=1.0,
     )
-    hybrid_error_low: FloatProperty(
-        name="Error Low",
+    auto_blend_error_low: FloatProperty(
+        name="Auto Blend Error Low",
         description="Below this error, adaptive Hybrid IK uses minimum strength",
         default=0.01,
         min=0.0001,
         max=0.2,
         subtype="DISTANCE",
     )
-    hybrid_error_high: FloatProperty(
-        name="Error High",
+    auto_blend_error_high: FloatProperty(
+        name="Auto Blend Error High",
         description="Above this error, adaptive Hybrid IK uses full strength",
         default=0.08,
         min=0.001,
@@ -244,8 +244,8 @@ class BVHMappingSettings(PropertyGroup):
             ),
             (
                 "IK_ONLY",
-                "IK Only",
-                "Skip FK baseline and solve from IK chains only",
+                "IK Only (Debug)",
+                "Debug mode: skip FK baseline and solve only from IK chains",
             ),
             (
                 "HYBRID",
@@ -294,10 +294,41 @@ class BVHMappingSettings(PropertyGroup):
         min=0.0,
         max=1.0,
     )
-    joint_smoothing: FloatProperty(
-        name="Joint Smoothing",
+    output_joint_smoothing: FloatProperty(
+        name="Output Joint Smoothing",
         description="Low-pass EMA filter on joint angles (actuator space)",
         default=0.1,
+        min=0.0,
+        max=1.0,
+    )
+    output_smoothing_policy: EnumProperty(
+        name="Output Smoothing Policy",
+        description=("How output joint smoothing is combined with IK target smoothing"),
+        items=[
+            (
+                "AUTO",
+                "Auto",
+                "Reduce output smoothing automatically when IK target smoothing is already high",
+            ),
+            (
+                "IK_REDUCED",
+                "IK Reduced",
+                "Always reduce output smoothing when IK contributes",
+            ),
+            (
+                "ALWAYS",
+                "Always Apply",
+                "Always use Joint Smoothing unchanged",
+            ),
+        ],
+        default="AUTO",
+    )
+    ik_output_smoothing_min: FloatProperty(
+        name="IK Output Smoothing Min",
+        description=(
+            "Minimum output smoothing factor when IK is active (higher means less post smoothing)"
+        ),
+        default=0.7,
         min=0.0,
         max=1.0,
     )
@@ -314,17 +345,10 @@ class BVHMappingSettings(PropertyGroup):
         max=3.14159,
         subtype="ANGLE",
     )
-    ik_iterations: IntProperty(
-        name="IK Iterations",
+    solver_iterations: IntProperty(
+        name="Solver Iterations",
         description="Maximum FABRIK iterations per kinematic chain and frame",
         default=12,
-        min=1,
-        max=64,
-    )
-    quality_ik_iterations: IntProperty(
-        name="Offline IK Iterations",
-        description="IK iterations used for offline quality passes (Bake and Export)",
-        default=64,
         min=1,
         max=64,
     )
@@ -350,73 +374,73 @@ class BVHMappingSettings(PropertyGroup):
         description="Collect and expose per-frame jitter diagnostics in scene properties",
         default=False,
     )
-    ik_tolerance: FloatProperty(
-        name="IK Tolerance",
+    solver_tolerance: FloatProperty(
+        name="Solver Tolerance",
         description="Stop the IK solve when the end-effector is closer than this distance to the target",
         default=0.01,
         min=0.0001,
         max=0.25,
         subtype="DISTANCE",
     )
-    ik_max_step_angle: FloatProperty(
-        name="IK Max Step",
+    solver_step_limit: FloatProperty(
+        name="Solver Max Step",
         description="Maximum joint-angle change per CCD update to avoid unstable flips",
         default=0.12,
         min=0.005,
         max=1.0,
         subtype="ANGLE",
     )
-    ik_target_scale: FloatProperty(
-        name="IK Target Scale",
+    solver_target_scale: FloatProperty(
+        name="Solver Target Scale",
         description="Manual amplitude scale for BVH end-effector motion in kinematic IK",
         default=1.0,
         min=0.1,
         max=2.0,
     )
-    ik_proportion_blend: FloatProperty(
-        name="IK Proportion Blend",
+    solver_proportion_blend: FloatProperty(
+        name="Solver Proportion Blend",
         description="Blend between absolute target matching (0) and proportion-scaled motion transfer (1)",
         default=0.75,
         min=0.0,
         max=1.0,
     )
-    ik_ground_lock_strength: FloatProperty(
-        name="IK Ground Lock",
+    solver_ground_lock_strength: FloatProperty(
+        name="Solver Ground Lock",
         description="For configured foot targets: keep vertical end-effector position close to calibrated ground pose while foot is grounded",
         default=0.7,
         min=0.0,
         max=1.0,
     )
-    ik_target_smoothing: FloatProperty(
-        name="IK Target Smoothing",
+    solver_target_smoothing: FloatProperty(
+        name="Solver Target Smoothing",
         description="Low-pass filter on end-effector target positions",
         default=0.25,
         min=0.0,
         max=0.98,
     )
-    hybrid_ik_blend: FloatProperty(
-        name="Hybrid IK Blend",
+    hybrid_master_blend: FloatProperty(
+        name="Hybrid Master Blend",
         description="Strength of IK correction on top of FK baseline (0 = FK only, 1 = full IK correction)",
         default=0.5,
         min=0.0,
         max=1.0,
     )
-    hybrid_adaptive_ik: BoolProperty(
-        name="Adaptive Hybrid IK",
+    hybrid_auto_blend: BoolProperty(
+        name="Adaptive Hybrid Blend",
         description=(
             "Scale IK correction strength by end-effector error in Hybrid mode "
             "(small error => less IK, large error => more IK)"
         ),
         default=True,
     )
-    hybrid_min_ik_blend: FloatProperty(
-        name="Hybrid Min IK",
+    hybrid_blend_min: FloatProperty(
+        name="Hybrid Blend Min",
         description="Minimum IK blend fraction used by adaptive Hybrid mode",
         default=0.2,
         min=0.0,
         max=1.0,
     )
-    hybrid_error_low: FloatProperty(
+    hybrid_blend_error_low: FloatProperty(
         name="Hybrid Error Low",
         description="At or below this end-effector error, adaptive IK uses minimum strength",
         default=0.01,
@@ -424,28 +448,13 @@ class BVHMappingSettings(PropertyGroup):
         max=0.2,
         subtype="DISTANCE",
     )
-    hybrid_error_high: FloatProperty(
+    hybrid_blend_error_high: FloatProperty(
         name="Hybrid Error High",
         description="At or above this end-effector error, adaptive IK uses full strength",
         default=0.08,
         min=0.001,
         max=0.5,
         subtype="DISTANCE",
-    )
-    hybrid_realtime_guard: BoolProperty(
-        name="Hybrid Realtime Guard",
-        description=(
-            "Dynamically reduce IK iterations when retargeting time exceeds "
-            "the current frame budget"
-        ),
-        default=True,
-    )
-    hybrid_min_iterations: IntProperty(
-        name="Hybrid Min Iterations",
-        description="Lower bound for IK iterations when realtime guard throttles",
-        default=4,
-        min=1,
-        max=64,
     )
 
     # Foot Contact & Anchoring

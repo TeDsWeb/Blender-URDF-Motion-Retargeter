@@ -1,5 +1,6 @@
 {
-  "format": "urdf_retargeting_mapping_v1",
+  "format": "urdf_retargeting_mapping_v3",
+  "schema_version": 3,
   "metadata": {
     "preset_name": "BoosterK1_OptiTrack_v1",
     "robot_profile": "Booster K1",
@@ -9,13 +10,14 @@
   },
   "settings": {
     "retargeting_method": "HYBRID",
-    "hybrid_adaptive_ik": true,
-    "hybrid_ik_blend": 0.5,
-    "hybrid_min_ik_blend": 0.2,
-    "hybrid_error_low": 0.01,
-    "hybrid_error_high": 0.08,
-    "hybrid_realtime_guard": true,
-    "hybrid_min_iterations": 4
+    "hybrid_auto_blend": true,
+    "hybrid_master_blend": 0.5,
+    "hybrid_blend_min": 0.2,
+    "hybrid_blend_error_low": 0.01,
+    "hybrid_blend_error_high": 0.08,
+    "solver_iterations": 12,
+    "solver_tolerance": 0.01,
+    "solver_step_limit": 0.12
   },
   "mappings": [],
   "kinematic_chains": []

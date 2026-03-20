@@ -151,20 +151,36 @@ After a code change, **Edit → Preferences → Add-ons → Reload Scripts** (or
 
 ### Retargeting Modes
 
-The current UI exposes two end-user retargeting modes:
+The current UI is built around a hybrid-first workflow:
 
 | Mode | Description |
 |---|---|
-| **Angle (FK)** | Direct twist extraction from BVH quaternions onto URDF joints. |
-| **Hybrid FK+IK** | Adaptive blend between FK and IK per chain; recommended for humanoid robots. |
+| **FK Only** | Direct twist extraction from BVH quaternions onto URDF joints without IK correction. |
+| **Hybrid FK + IK** | Adaptive blend between FK baseline and IK correction per chain; the intended production workflow. |
+| **IK Only (Debug)** | Debug-only mode that bypasses the FK baseline to inspect solver behavior in isolation. |
+
+### Key Runtime Controls
+
+The most important global tuning properties are now grouped conceptually as follows:
+
+| Group | Canonical properties | Purpose |
+|---|---|---|
+| **Output smoothing** | `output_joint_smoothing`, `output_smoothing_policy`, `ik_output_smoothing_min` | Controls post-process damping and how strongly IK target smoothing suppresses additional output damping. |
+| **Solver** | `solver_iterations`, `solver_tolerance`, `solver_step_limit`, `solver_target_scale`, `solver_proportion_blend`, `solver_ground_lock_strength`, `solver_target_smoothing` | Controls FABRIK-C quality, stability and end-effector target behavior. |
+| **Hybrid blend** | `hybrid_master_blend`, `hybrid_auto_blend`, `hybrid_blend_min`, `hybrid_blend_error_low`, `hybrid_blend_error_high` | Controls how strongly IK corrects the FK baseline and how that influence scales with residual error. |
+| **Per-chain override** | `solver_orientation_weight`, `use_auto_blend_override`, `auto_blend_min`, `auto_blend_error_low`, `auto_blend_error_high` | Overrides the global hybrid behavior for a specific kinematic chain. |
+
+Older presets are still supported. On import, legacy field names are migrated automatically to the new canonical property names.
 
 ### Motion Quality & Stabilisation
 
 - **Zero-Lag Smoothing**: Bidirectional (forward + backward) filtering of BVH F-curves – reduces noise without phase delay.
-- **Joint Smoothing**: Exponential smoothing of URDF joint angles per frame.
+- **Output Joint Smoothing**: Exponential smoothing of URDF joint angles per frame after FK, IK and foot-alignment writes have been merged.
+- **Smoothing Policy**: `output_smoothing_policy` avoids double damping when `solver_target_smoothing` is already high; runtime telemetry exposes the effective output smoothing used each frame.
 - **Foot Contact Detection**: Hysteresis-based contact detection; stance foot is anchored to the ground (foot planting).
 - **Anti-Sinking / Auto-Grounding**: Automatically raises the robot so the lowest point never drops below Z=0.
 - **Jump Support**: Persistent corrections are frozen during airborne phases; new anchor points are set on landing.
+- **Shared FK/IK Continuity Guard**: FK, IK and foot-alignment now pass through a shared continuity/jump-threshold write path before final output smoothing.
 - **Persistent Correction with Decay**: Gradual rollback of corrections (`correction_decay`) keeps the trajectory close to the original.
 
 ### Export – Beyond Mimic
@@ -193,3 +209,5 @@ The current UI exposes two end-user retargeting modes:
 ```
 
 > **Tip:** Saving a mapping preset (`Save Preset`) persists all tuning parameters, kinematic chains, and the custom default pose — making the entire setup instantly restorable on another machine or for a different BVH instance.
+
+> **Testing Tip:** Use [BLENDER_RUNTIME_TEST_PLAN.md](BLENDER_RUNTIME_TEST_PLAN.md) to verify Hybrid mode, IK-only debug behavior, smoothing telemetry, preset migration, Bake and Export after changes.
