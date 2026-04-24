@@ -28,10 +28,9 @@ jobs:
       - name: Get version from blender_manifest.toml
         id: get_version
         run: |
-          VERSION=$(grep -Po 'version\s*=\s*"\K[^"]+' urdf_retargeting/blender_manifest.toml)
-            VERSION=$(echo "$VERSION" | tr -d '\n')
-            echo "VERSION: $VERSION"
-            echo "version=$VERSION" >> $GITHUB_OUTPUT
+          VERSION=$(grep -Po '^version\s*=\s*"\K[^"]+' urdf_retargeting/blender_manifest.toml | tr -d '\n')
+          echo "VERSION: $VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
