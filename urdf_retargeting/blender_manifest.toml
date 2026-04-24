@@ -3,7 +3,7 @@ schema_version = "1.0.0"
 id = "urdf_retargeting"
 name = "URDF Retargeting"
 version = "0.1.0"
-tagline = "Import URDF humanoids and retarget BVH animations"
+tagline = "Import URDF humanoids and retarget motion capture animations"
 maintainer = "Dominik Brämer"
 type = "add-on"
 
