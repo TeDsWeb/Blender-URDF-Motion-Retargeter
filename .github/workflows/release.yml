@@ -6,6 +6,7 @@ on:
       - 'urdf_retargeting/blender_manifest.toml'
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
   build-and-release:
@@ -28,7 +29,9 @@ jobs:
         id: get_version
         run: |
           VERSION=$(grep -Po 'version\s*=\s*"\K[^"]+' urdf_retargeting/blender_manifest.toml)
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+            VERSION=$(echo "$VERSION" | tr -d '\n')
+            echo "VERSION: $VERSION"
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
