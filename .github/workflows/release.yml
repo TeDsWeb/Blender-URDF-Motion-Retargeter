@@ -1,0 +1,41 @@
+name: Build and Release Blender Addon
+
+on:
+  push:
+    paths:
+      - 'urdf_retargeting/blender_manifest.toml'
+    branches:
+      - main
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Create ZIP
+        run: |
+          cd urdf_retargeting
+          zip -r ../urdf_retargeting.zip .
+
+      - name: Get version from blender_manifest.toml
+        id: get_version
+        run: |
+          VERSION=$(grep -Po 'version\s*=\s*"\K[^"]+' blender_manifest.toml)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.get_version.outputs.version }}
+          name: Release v${{ steps.get_version.outputs.version }}
+          body_path: CHANGELOG.md
+          files: urdf_retargeting.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
