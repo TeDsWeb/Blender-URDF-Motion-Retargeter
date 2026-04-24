@@ -2,8 +2,6 @@
 
 ## Step-by-Step Tutorial for New Users
 
-This section provides a complete onboarding tutorial for first-time users, as required for RoboCup open-source submissions.
-
 ### Goal
 Import a humanoid URDF robot, retarget a BVH motion, and export a Beyond Mimic trajectory.
 
